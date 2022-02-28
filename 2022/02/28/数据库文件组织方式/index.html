@@ -27,12 +27,12 @@
 <meta property="og:site_name" content="Hexo">
 <meta property="og:description" content="heap file Sequential file特点：记录按照某个属性或者属性组值得顺序插入，磁盘上的存储记录是有序的，检索的效率可能高。用于存储排序的字段通常称为排序字段，排序字段一般使用关系之中的主键，又称为排序码。当按排序字段检索的时候检索的速度会得到提高，但是当按照非排序字段检索的时候检索的速度不会提高很多。但是有序的文件组织的更新效率比较低，因为在插入数据的时候要大规模的移动数据为插入">
 <meta property="og:locale" content="en_US">
-<meta property="og:image" content="http://example.com/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F.assets/image-20220228163338204.png">
-<meta property="article:published_time" content="2022-02-28T08:31:21.000Z">
-<meta property="article:modified_time" content="2022-02-28T08:39:13.470Z">
+<meta property="og:image" content="http://example.com/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F/image-20220228163338204.png">
+<meta property="article:published_time" content="2022-02-28T08:57:16.000Z">
+<meta property="article:modified_time" content="2022-02-28T09:02:26.656Z">
 <meta property="article:author" content="John Doe">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:image" content="http://example.com/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F.assets/image-20220228163338204.png">
+<meta name="twitter:image" content="http://example.com/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F/image-20220228163338204.png">
 
 <link rel="canonical" href="http://example.com/2022/02/28/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F/">
 
@@ -176,7 +176,7 @@
               <span class="post-meta-item-text">Posted on</span>
               
 
-              <time title="Created: 2022-02-28 16:31:21 / Modified: 16:39:13" itemprop="dateCreated datePublished" datetime="2022-02-28T16:31:21+08:00">2022-02-28</time>
+              <time title="Created: 2022-02-28 16:57:16 / Modified: 17:02:26" itemprop="dateCreated datePublished" datetime="2022-02-28T16:57:16+08:00">2022-02-28</time>
             </span>
 
           
@@ -190,7 +190,7 @@
     <div class="post-body" itemprop="articleBody">
 
       
-        <h3 id="heap-file"><a href="#heap-file" class="headerlink" title="heap file"></a>heap file</h3><p><img src="/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F.assets/image-20220228163338204.png" alt="image-20220228163338204"></p>
+        <h3 id="heap-file"><a href="#heap-file" class="headerlink" title="heap file"></a>heap file</h3><p><img src="/%E6%95%B0%E6%8D%AE%E5%BA%93%E6%96%87%E4%BB%B6%E7%BB%84%E7%BB%87%E6%96%B9%E5%BC%8F/image-20220228163338204.png" alt="image-20220228163338204"></p>
 <h3 id="Sequential-file"><a href="#Sequential-file" class="headerlink" title="Sequential file"></a>Sequential file</h3><p>特点：记录按照某个属性或者属性组值得顺序插入，磁盘上的存储记录是有序的，检索的效率可能高。<br>用于存储排序的字段通常称为排序字段，排序字段一般使用关系之中的主键，又称为排序码。当按排序字段检索的时候检索的速度会得到提高，但是当按照非排序字段检索的时候检索的速度不会提高很多。但是有序的文件组织的更新效率比较低，因为在插入数据的时候要大规模的移动数据为插入数据留出空间而且是不安全的。<br>改进：使用一个临时无序文件（溢出文件）保留新增记录。当采取溢出文件的时候检索既要操作主文件又要操作溢出文件，所以需要周期性的重组数据库。</p>
 <h3 id="hash-file"><a href="#hash-file" class="headerlink" title="hash file"></a>hash file</h3><p>特点：将记录某个属性或者属性组值，依据散列函数计算出其应该存放的位置：桶号。<strong>检索的效率和跟新的效率都有一定的提升</strong>。<br>用于进行散列函数的属性或者属性组的值称为散列字段，通常采用<br>关系中的主码，也叫<strong>散列码</strong>。</p>
 <h3 id="clustering-file"><a href="#clustering-file" class="headerlink" title="clustering file"></a>clustering file</h3><p><strong>聚簇</strong>：将具有相同或相似属性值的记录存放于连续的磁盘簇块中。<br><strong>多表聚簇</strong>：将若干相关联的表存储在同一个文件中，这样可以提高多表查寻的速度。</p>
