@@ -1,0 +1,30 @@
+mirrors解法
+public int kthLargest(TreeNode root, int k) {
+    TreeNode cur = root;
+    TreeNode pre = null;
+    int pos = 0;
+    while (cur != null) {
+        if (cur.right == null) {
+            pos++;
+            if (pos==k)
+                break;
+            cur = cur.left;
+            continue;
+        }
+        pre = cur.right;
+        while (pre.left!=null && pre.left!=cur){
+            pre = pre.left;
+        }
+        if (pre.left==null){
+            pre.left = cur;
+            cur = cur.right;
+        }else{
+            pre.left = null;
+            pos++;
+            if (pos==k)
+                break;
+            cur= cur.left;
+        }
+    }
+    return cur.val;
+}
