@@ -3,7 +3,6 @@
 #define eb emplace_back
 using namespace std;
 #define inf 0x3f3f3f3f
-using namespace std;
 const int M=1e4+10;
 const int N=510;
 int m,n;
