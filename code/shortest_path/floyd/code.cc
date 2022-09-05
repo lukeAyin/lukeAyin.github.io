@@ -26,7 +26,8 @@ void floyd(){
             }
         }
     }
-    for(int k=1;k<=n;++k){
+    for(int k=1;k<=n;++k){//要把k放在最外层，如果把k放在最内层的话，会导致路径搜索的深度还不够
+    //但是已经把一些路径的最小值给锁死了，就得不到准确的最小值
         for(int i=1;i<=n;++i){
             for(int j=1;j<=n;++j){
                 if(dis[i][j]>dis[i][k]+dis[k][j]){
