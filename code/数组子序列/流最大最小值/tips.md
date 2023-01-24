@@ -1,0 +1,1 @@
+1. 灵活使用set、multiset，queue，set用来存储极值，queue用来存储队列，然后在入队出队的时候添加判断与操作。
