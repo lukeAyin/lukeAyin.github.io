@@ -10,91 +10,62 @@ int board[MAXL][MAXL];
 int x,y;//小狮工位
 int nx,ny;//办公室出口
 int step[4][2]={-1,0,0,-1,1,0,0,1};//下，左，上，右
-map<int,int> path[MAXL][MAXL][2];//存储下标的已访问灯下标，走的步数
 unordered_map<int,int> id_map;//给灯泡标号，方便判断是否已经访问这个灯
 //灯的下标可以使用int来存，用位运算来判断是否有这个灯
 
-inline bool CheckBoard(int i,int j){
+inline bool InBoard(int i,int j){
     return i>=0&&i<L&&j>=0&&j<L;
 }
 
-int GetMaxLight(){
-    queue<pii> q1,q2;
-    q1.push(make_pair(x*L+y,0));
-    set<pii> visited1;//存储下标+状态
-    set<pii> visited2;//
-    q2.push(make_pair(nx*L+ny,0));
-    int let=0;//
+inline int CountNum(int x){//根据灯泡状态得到关灯数量
     int res=0;
-    while (!q1.empty()&&q2.empty())//有一个为空都代表两点无法连通
-    {
-        if(let>timeLimit){
+    while(x){
+        x&=(x-1);
+        res++;
+    }
+    return res;
+}
 
-        }
-        int len=q1.size();
+int GetMaxLight(){
+    queue<pii> q;//bfs存状态
+    q.push(make_pair(x*L+y,0));
+    set<pii> visited;//存储下标+灯泡状态作为搜索剪枝条件
+    visited.insert(make_pair(x*L+y,0));
+    int let=0;//记录步数
+    int res=-1;
+    while (!q.empty()&&let<timeLimit)//
+    {
+        int len=q.size();
         while(len--){
-            int i=q1.front().first/L;
-            int j=q1.front().first%L;
-            int status=q1.front().second;
-            q1.pop();
+            int i=q.front().first/L;
+            int j=q.front().first%L;
+            int status=q.front().second;
+            q.pop();
             for(int k=0;k<4;k++){
                 int ni=i+step[k][0];
                 int nj=j+step[k][1];
                 int nstatus=status;
-                if(!CheckBoard(ni,nj)||board[ni][nj]==1){//下标越界或不可通过
+                if(!InBoard(ni,nj)||board[ni][nj]==1){//下标越界或不可通过
                     continue;
                 }
-                if(board[ni][nj]==2){
+                if(board[ni][nj]==2){//当前位置是灯泡
                     int nid=id_map[ni*L+nj];
-                    if(nstatus&(!(1<<nid))){//已经访问过这个灯
-                        continue;
-                    }else{
-                        nstatus|=(1<<nid);
-                    }
+                    nstatus|=(1<<nid);//记录灯泡状态
                 }
                 pii np=make_pair(ni*L+nj,nstatus);
-                if(visited1.count(np)){
+                if(visited.count(np)){//当前状态已经访问过
                     continue;
                 }
-                
-                visited1.insert(np);
-                q1.push(np);
-            }
-            len=q2.size();
-            while(len--){
-                int i=q2.front().first/L;
-                int j=q2.front().second%L;
-                int status =q2.front().second;
-                q2.pop();
-                for(int k=0;k<4;k++){
-                    int ni=i+step[k][0];
-                    int nj=j+step[k][1];
-                    int nstatus=status;
-                    if(!CheckBoard(ni,nj)||board[ni][nj]==1){
-                        continue;
-                    }
-                    if(board[ni][nj]==2){
-                        int nid=id_map[ni*L+nj];
-                        if(nstatus&(1<<nid)){
-                            continue;
-                        }else{
-                            nstatus|=(1<<nid);
-                        }
-                    }
-                    pii np=make_pair(ni*L+nj,nstatus);
-                    if(visited2.count(np)){
-                        continue;
-                    }
-                    visited2.insert(np);
-                    q2.push(np);
+                if(ni==nx&&nj==ny){
+                    res=max(res,CountNum(nstatus));//更新返回值
                 }
+                visited.insert(np);
+                q.push(np);
             }
         }
         let++;
     }
-
-    return -1;  
-    
+    return res;
 }
 
 
@@ -118,4 +89,5 @@ int main(){
             }
         }
     }
+    printf("%d",GetMaxLight());
 }
