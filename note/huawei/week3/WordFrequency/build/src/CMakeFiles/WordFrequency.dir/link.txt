@@ -1,0 +1,2 @@
+/usr/sbin/ar qc libWordFrequency.a CMakeFiles/WordFrequency.dir/word_frequency.c.o CMakeFiles/WordFrequency.dir/input.c.o CMakeFiles/WordFrequency.dir/list.c.o
+/usr/sbin/ranlib libWordFrequency.a

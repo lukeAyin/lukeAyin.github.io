@@ -1,0 +1,2 @@
+C:\MinGW\bin\ar.exe qc libWordFrequency.a  CMakeFiles/WordFrequency.dir/word_frequency.c.obj CMakeFiles/WordFrequency.dir/input.c.obj CMakeFiles/WordFrequency.dir/list.c.obj
+C:\MinGW\bin\ranlib.exe libWordFrequency.a

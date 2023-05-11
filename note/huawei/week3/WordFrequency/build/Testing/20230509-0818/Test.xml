@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Site BuildName="(empty)"
+	BuildStamp="20230509-0818-Experimental"
+	Name="(empty)"
+	Generator="ctest-3.26.3"
+	CompilerName=""
+	CompilerVersion=""
+	OSName="Linux"
+	Hostname="DESKTOP-4OVN5A7"
+	OSRelease="5.15.90.1-microsoft-standard-WSL2"
+	OSVersion="#1 SMP Fri Jan 27 02:56:13 UTC 2023"
+	OSPlatform="x86_64"
+	Is64Bits="1"
+	VendorString="AuthenticAMD"
+	VendorID="Advanced Micro Devices"
+	FamilyID="23"
+	ModelID="96"
+	ProcessorCacheSize="512"
+	NumberOfLogicalCPU="16"
+	NumberOfPhysicalCPU="8"
+	TotalVirtualMemory="2048"
+	TotalPhysicalMemory="7650"
+	LogicalProcessorsPerPhysical="2"
+	ProcessorClockFrequency="2894.57"
+	>
+	<Testing>
+		<StartDateTime>May 09 16:18 CST</StartDateTime>
+		<StartTestTime>1683620313</StartTestTime>
+		<TestList>
+			<Test>./tests/WordFrequencyTest</Test>
+		</TestList>
+		<Test Status="notrun">
+			<Name>WordFrequencyTest</Name>
+			<Path>./tests</Path>
+			<FullName>./tests/WordFrequencyTest</FullName>
+			<FullCommandLine></FullCommandLine>
+			<Results>
+				<NamedMeasurement type="numeric/double" name="Processors">
+					<Value>1</Value>
+				</NamedMeasurement>
+				<NamedMeasurement type="text/string" name="Completion Status">
+					<Value>Unable to find executable</Value>
+				</NamedMeasurement>
+				<NamedMeasurement type="text/string" name="Command Line">
+					<Value></Value>
+				</NamedMeasurement>
+				<NamedMeasurement type="text/string" name="Environment">
+					<Value></Value>
+				</NamedMeasurement>
+				<Measurement>
+					<Value>Unable to find executable: /mnt/d/code/lukeAyin.github.io/note/huawei/week3/WordFrequency/build/tests/WordFrequencyTest</Value>
+				</Measurement>
+			</Results>
+		</Test>
+		<EndDateTime>May 09 16:18 CST</EndDateTime>
+		<EndTestTime>1683620314</EndTestTime>
+		<ElapsedMinutes>0</ElapsedMinutes>
+	</Testing>
+</Site>

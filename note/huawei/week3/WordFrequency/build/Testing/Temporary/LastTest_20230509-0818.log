@@ -1,0 +1,19 @@
+Start testing: May 09 16:18 CST
+----------------------------------------------------------
+Unable to find executable: /mnt/d/code/lukeAyin.github.io/note/huawei/week3/WordFrequency/build/tests/WordFrequencyTest
+1/1 Testing: WordFrequencyTest
+1/1 Test: WordFrequencyTest
+Command: ""
+Directory: /mnt/d/code/lukeAyin.github.io/note/huawei/week3/WordFrequency/build/tests
+"WordFrequencyTest" start time: 
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"WordFrequencyTest" end time: May 09 16:18 CST
+"WordFrequencyTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: May 09 16:18 CST

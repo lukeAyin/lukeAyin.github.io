@@ -1,0 +1,1 @@
+-IF:/Training/CMini/word_frequency/WordFrequency/tests/googletest/googlemock/include -IF:/Training/CMini/word_frequency/WordFrequency/tests/googletest/googlemock -isystem F:/Training/CMini/word_frequency/WordFrequency/tests/googletest/googletest/include -isystem F:/Training/CMini/word_frequency/WordFrequency/tests/googletest/googletest 

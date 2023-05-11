@@ -1,0 +1,28 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../include/WordFrequency.h
+
+../include/input.h
+stdbool.h
+-
+
+../include/pointerCheck.h
+
+F:/Training/CMini/word_frequency/WordFrequency/src/main.c
+stdio.h
+-
+stdlib.h
+-
+WordFrequency.h
+F:/Training/CMini/word_frequency/WordFrequency/src/WordFrequency.h
+input.h
+F:/Training/CMini/word_frequency/WordFrequency/src/input.h
+pointerCheck.h
+F:/Training/CMini/word_frequency/WordFrequency/src/pointerCheck.h
+

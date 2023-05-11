@@ -1,0 +1,1 @@
+/usr/sbin/g++ -Wno-error -g -rdynamic CMakeFiles/WordFrequencyTest.dir/test.cc.o CMakeFiles/WordFrequencyTest.dir/main.cc.o -o WordFrequencyTest  ../src/libWordFrequency.a googletest/googlemock/gtest/libgtest_maind.a googletest/googlemock/gtest/libgtestd.a 
