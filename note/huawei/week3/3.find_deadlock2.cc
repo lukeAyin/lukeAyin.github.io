@@ -25,28 +25,33 @@ void GetDeadLockList(){
         {
             int id=q.front();
             q.pop();
-            id_visited[id]=2;
             for(auto k:waited[id]){
                 if(res_map.find(k)!=res_map.end()){//有占用该资源的
-                    if(id_visited[i]==3||id_visited[i]==1){//死锁
+                int nid=res_map[k];
+                    if(id_visited[nid]==3||id_visited[nid]==1){//死锁
                         for(int j=0;j<MAXID;j++){
                             if(id_visited[j]==1){
                                 id_visited[j]==3;
                             }
                         }
-                    }else if(id_visited[i]==0){
-                        id_visited[i]=1;
-                        q.push(i);
+                    }else if(id_visited[nid]==0){
+                        id_visited[nid]=1;
+                        q.push(nid);
                     }
                 }
             }
         }
+        for(int j=0;j<MAXID;j++){
+            if(id_visited[j]==1){
+                id_visited[j]=2;
+            }
+        }
     }
-    for(int i=0;i<MAXID;i++){
-        if(id_visited[i]==3)
-        printf("%d ",i);
+    for(int j=0;j<MAXID;j++){
+        if(id_visited[j]==3){
+            printf("%d ",j);
+        }
     }
-    
 }
 int main(){
     fstream input("3.find_deadlock.txt");
@@ -60,9 +65,9 @@ int main(){
         int ed1=str.find(')');
         int st2=str.find('(',ed1)+1;
         int ed2=str.find(')',st2);
-        // cout<<str.substr(0,st1-1)<<endl;
+        cout<<str.substr(0,st1-1)<<endl;
         int id=stoi(str.substr(0,st1-1));
-        // cout<<str.substr(st1,ed1-st1)<<" "<<str.substr(st2,ed2-st2)<<endl;
+        cout<<str.substr(st1,ed1-st1)<<" "<<str.substr(st2,ed2-st2)<<endl;
         istringstream iss1(str.substr(st1,ed1-st1));
         string tmp;
         while (iss1>>tmp)
