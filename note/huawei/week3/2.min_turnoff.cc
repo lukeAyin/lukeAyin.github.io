@@ -33,6 +33,7 @@ int GetMaxLight(){
     visited.insert(make_pair(x*L+y,0));
     int let=0;//记录步数
     int res=-1;
+    int x=0;
     while (!q.empty()&&let<timeLimit)//
     {
         int len=q.size();
@@ -62,9 +63,11 @@ int GetMaxLight(){
                 visited.insert(np);
                 q.push(np);
             }
+            x++;
         }
         let++;
     }
+    cout<<"时间复杂度："<<x<<endl;
     return res;
 }
 
