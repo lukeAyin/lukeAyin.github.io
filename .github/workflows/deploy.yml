@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "index.md"
+      - "404.md"
+      - "_config.yml"
+      - "sglang/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 permissions:
