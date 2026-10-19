@@ -1,1 +1,26 @@
+title: "lukeayin's blog"
+description: 记录代码、系统与 AI 工程的实践笔记
+lang: zh-CN
 theme: jekyll-theme-cayman
+show_downloads: false
+
+plugins:
+  - jekyll-relative-links
+
+exclude:
+  - README.md
+  - code
+  - interview
+  - iq
+  - note
+  - judge
+  - "**/*.cc"
+  - "**/*.out"
+  - "**/*.docx"
+
+defaults:
+  - scope:
+      path: "sglang"
+    values:
+      layout: default
+      order: 99

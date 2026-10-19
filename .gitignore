@@ -1,3 +1,9 @@
 *.out
 *.vscode
 *.docx
+
+# Jekyll build artifacts
+_site/
+.jekyll-cache/
+.jekyll-metadata
+.sass-cache/
