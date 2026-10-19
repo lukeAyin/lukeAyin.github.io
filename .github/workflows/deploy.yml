@@ -1,0 +1,87 @@
+name: Deploy blog
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gh-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Install Jekyll dependencies
+        run: |
+          gem install jekyll -v 4.4.1 --no-document
+          gem install jekyll-theme-cayman -v 0.2.0 --no-document
+          gem install jekyll-seo-tag -v 2.9.1 --no-document
+          gem install jekyll-relative-links -v 0.9.1 --no-document
+
+      - name: Build site
+        run: |
+          rm -rf .build-src _site
+          mkdir -p .build-src
+          cp _config.yml index.md 404.md .build-src/
+          cp -a sglang .build-src/
+          jekyll build --source .build-src --destination _site
+          touch _site/.nojekyll
+
+      - name: Upload site
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: _site
+          if-no-files-found: error
+
+  deploy:
+    name: Publish to gh-pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Download built site
+        uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: ${{ runner.temp }}/site
+
+      - name: Replace published files
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$RUNNER_TEMP/site/." .
+          touch .nojekyll
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No site changes to deploy."
+            exit 0
+          fi
+          git commit -m "Deploy site from ${GITHUB_SHA::7}"
+          git push origin gh-pages
