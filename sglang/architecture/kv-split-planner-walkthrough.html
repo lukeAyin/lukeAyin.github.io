@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+
+<!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>get_num_kv_splits 逐步解读与 FFN 并行边界 | lukeayin’s blog</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="get_num_kv_splits 逐步解读与 FFN 并行边界" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="description" content="get_num_kv_splits 的三个分支、动态启发式与实际 split 范围" />
+<meta name="twitter:description" property="og:description" content="get_num_kv_splits 的三个分支、动态启发式与实际 split 范围" />
+<meta property="og:site_name" content="lukeayin’s blog" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="get_num_kv_splits 逐步解读与 FFN 并行边界" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"get_num_kv_splits 的三个分支、动态启发式与实际 split 范围","headline":"get_num_kv_splits 逐步解读与 FFN 并行边界","url":"/sglang/architecture/kv-split-planner-walkthrough.html"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link rel="preload" href="https://fonts.googleapis.com/css?family=Open+Sans:400,700&display=swap" as="style" type="text/css" crossorigin>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#157878">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <a id="skip-to-content" href="#content">Skip to the content.</a>
+
+    <header class="page-header" role="banner">
+      <h1 class="project-name">get_num_kv_splits 逐步解读与 FFN 并行边界</h1>
+      <h2 class="project-tagline">get_num_kv_splits 的三个分支、动态启发式与实际 split 范围</h2>
+      
+      
+    </header>
+
+    <main id="content" class="main-content" role="main">
+      <h1 id="get_num_kv_splits-逐步解读与-ffn-并行边界">get_num_kv_splits 逐步解读与 FFN 并行边界</h1>
+
+<p>状态：源码学习专题；未运行 GPU/NPU kernel。
+基线：<code class="language-plaintext highlighter-rouge">0957288be0818686034f33a3a7441434e4f5ba33</code>，2026-10-19。
+范围：当前 Triton 后端的拆分规划与普通 decode 两阶段实现。GQA/MLA、Lean 等路径可能有不同 launch 方式，不泛化为 Ascend。</p>
+
+<p>源码入口（相对 <code class="language-plaintext highlighter-rouge">python/sglang/</code>）：</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">srt/layers/attention/triton_backend.py</code>：初始化、<code class="language-plaintext highlighter-rouge">get_num_kv_splits()</code>、decode metadata 更新。</li>
+  <li><code class="language-plaintext highlighter-rouge">kernels/ops/attention/metadata.py</code>：<code class="language-plaintext highlighter-rouge">get_num_kv_splits_triton()</code>。</li>
+  <li><code class="language-plaintext highlighter-rouge">kernels/ops/attention/decode_attention.py</code>：stage 1 的实际 KV 范围与 stage 2 归并。</li>
+  <li><code class="language-plaintext highlighter-rouge">srt/models/qwen2.py</code>：attention 输出投影与 MLP 的张量边界。</li>
+</ul>
+
+<h2 id="1-函数职责填写规划结果不搬运-kv">1. 函数职责：填写规划结果，不搬运 KV</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nf">get_num_kv_splits</span><span class="p">(</span><span class="n">self</span><span class="p">,</span> <span class="n">num_kv_splits</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">seq_lens</code> 是输入长度数组；<code class="language-plaintext highlighter-rouge">num_kv_splits</code> 是预分配的输出数组，由函数原地填写。函数不返回 KV 块，不在此复制 K/V，也不实际执行 attention。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>变量</th>
+      <th>含义</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">seq_lens</code></td>
+      <td>每个原序列传入规划器的 KV 长度；可能已被 DCP 本地化或滑动窗口处理，不能总等同于完整 prompt 长度</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">num_kv_splits</code></td>
+      <td>每个执行条目的规划拆分数；普通 decode 通常每请求一项</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">num_seq</code></td>
+      <td><code class="language-plaintext highlighter-rouge">seq_lens.shape[0]</code>，原序列条目数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">num_token</code></td>
+      <td>输出数组 <code class="language-plaintext highlighter-rouge">num_kv_splits.shape[0]</code>，本函数使用的执行条目数；不是 KV 长度总和，也不是 prefill token 总数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">num_group</code></td>
+      <td><code class="language-plaintext highlighter-rouge">num_token // num_seq</code>，一个原序列对应多少执行条目；普通 decode 为 1，某些投机展开路径可能大于 1</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.num_head</code></td>
+      <td>此后端执行布局中的 query head 数，已受 TP/DCP 等配置调整</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.num_kv_head</code></td>
+      <td>对应布局中的 KV head 数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.device_core_count</code></td>
+      <td>设备并行资源计数，供规划使用；不是当前空闲核心的实时测量</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.max_kv_splits</code></td>
+      <td>本路径拆分容量/上限，初始化时可能被 MLA、最大上下文或 tile 配置调整；不是动态路径每请求必用的份数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.static_kv_splits</code></td>
+      <td>是否请求固定份数路径；初始化读取的开关默认关闭</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.enable_deterministic</code></td>
+      <td>是否启用确定性推理相关行为</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">self.split_tile_size</code></td>
+      <td>用于某些路径的目标 KV 段长；与 <code class="language-plaintext highlighter-rouge">num_group</code>、head 分组、page size 均不同</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>开头的整除断言要求 <code class="language-plaintext highlighter-rouge">num_group * num_seq == num_token</code>。它把原序列与展开执行条目的映射固定为每序列相同条目数。例如 <code class="language-plaintext highlighter-rouge">num_group=2</code> 时，输出拆分数按 <code class="language-plaintext highlighter-rouge">[sA, sA, sB, sB, ...]</code> 复制。不要将这里的 <code class="language-plaintext highlighter-rouge">num_group</code> 与 GQA 的 head 分组混淆。</p>
+
+<h2 id="2-python-包装函数的三个分支">2. Python 包装函数的三个分支</h2>
+
+<h3 id="固定份数">固定份数</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nf">if </span><span class="p">(</span><span class="n">static_kv_splits</span> <span class="ow">or</span> <span class="n">device_core_count</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">enable_deterministic</span><span class="p">:</span>
+    <span class="n">num_kv_splits</span><span class="p">.</span><span class="nf">fill_</span><span class="p">(</span><span class="n">max_kv_splits</span><span class="p">)</span>
+    <span class="k">return</span>
+</code></pre></div></div>
+
+<p>所有条目使用同一规划份数。短序列可能因对齐而出现没有有效计算范围的 split；实际范围由后面的 kernel 决定。</p>
+
+<h3 id="确定性相关的目标段长">确定性相关的目标段长</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">if</span> <span class="n">split_tile_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">None</span> <span class="ow">and</span> <span class="n">enable_deterministic</span><span class="p">:</span>
+    <span class="n">expanded_seq_lens</span> <span class="o">=</span> <span class="n">seq_lens</span><span class="p">.</span><span class="nf">repeat_interleave</span><span class="p">(</span><span class="n">num_group</span><span class="p">)</span>  <span class="c1"># 当 group &gt; 1
+</span>    <span class="n">num_kv_splits</span><span class="p">[:]</span> <span class="o">=</span> <span class="nf">ceil_div</span><span class="p">(</span><span class="n">expanded_seq_lens</span><span class="p">,</span> <span class="n">split_tile_size</span><span class="p">)</span>
+    <span class="k">return</span>
+</code></pre></div></div>
+
+<p>这将拆分数主要绑定到该序列的长度，而不是同批其他请求的长短或 batch 大小。初始化注释说明其用于 batch invariance；不能仅凭这个函数就证明完整推理所有算子均具有确定性。</p>
+
+<p>需要收紧此前“固定段长”的表述：这里固定的是计算份数时使用的<strong>目标段长</strong>，普通 stage 1 仍会按长度、份数和最小计算块重新确定实际边界，见第 6 节。不能保证每个实际 split 都严格等于 <code class="language-plaintext highlighter-rouge">split_tile_size</code>。</p>
+
+<h3 id="动态规划">动态规划</h3>
+
+<p>其他对应路径设置：</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">SCHEDULE_SEQ</span> <span class="o">=</span> <span class="mi">256</span> <span class="k">if</span> <span class="n">num_seq</span> <span class="o">&lt;</span> <span class="mi">256</span> <span class="k">else</span> <span class="nf">next_power_of_2</span><span class="p">(</span><span class="n">num_seq</span><span class="p">)</span>
+<span class="n">get_num_kv_splits_triton</span><span class="p">[(</span><span class="mi">1</span><span class="p">,)](...,</span> <span class="n">MAX_NUM_SEQ</span><span class="o">=</span><span class="n">SCHEDULE_SEQ</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">SCHEDULE_SEQ</code> 是规划 kernel 处理长度数组时的向量容量，不是 batch size、split 数或设备核心数。padding 后的位置会被 mask。<code class="language-plaintext highlighter-rouge">[(1,)]</code> 表示启动一个用于规划的 Triton program；不表示 attention 只有一个并行任务。</p>
+
+<h2 id="3-动态规划先处理长度差异">3. 动态规划：先处理长度差异</h2>
+
+<p>以下记 <code class="language-plaintext highlighter-rouge">ceil_div(a,b)</code> 为向上取整的整数除法，输入有效长度为正。</p>
+
+<p><code class="language-plaintext highlighter-rouge">offs_seq</code> 是向量索引，<code class="language-plaintext highlighter-rouge">mask_seq</code> 区分有效请求。求最大值时无效位置填 0，求最小值时无效位置填最大长度，避免 padding 的 0 把最小值错误变成 0。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">max_seq_len</span> <span class="o">=</span> <span class="nf">max</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">)</span>
+<span class="n">min_seq_len</span> <span class="o">=</span> <span class="nf">min</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">max_seq_len</span> <span class="o">*</span> <span class="mi">8</span> <span class="o">&lt;</span> <span class="n">min_seq_len</span> <span class="o">*</span> <span class="mi">10</span><span class="p">:</span>
+    <span class="n">min_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
+</code></pre></div></div>
+
+<p>最大长度小于最小长度的 1.25 倍时，这一分支把它们视为足够接近，忽略长度差异的拆分动机。其他利用率分支仍然可以拆分。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">max_kv_splits_1</span> <span class="o">=</span> <span class="nf">min</span><span class="p">(</span><span class="nf">ceil_div</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="n">min_seq_len</span><span class="p">),</span> <span class="n">max_kv_splits</span><span class="p">)</span>
+<span class="n">kv_chunk_size_1</span> <span class="o">=</span> <span class="nf">ceil_div</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="n">max_kv_splits_1</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">max_kv_splits_1</code> 是“长度差异”给最长序列提出的拆分数；<code class="language-plaintext highlighter-rouge">kv_chunk_size_1</code> 是据此得到的目标粒度。各请求再按自己的长度映射到份数。它不是保证每个任务严格等长的精确最优化算法。</p>
+
+<h2 id="4-动态规划再估计需要多少并行任务">4. 动态规划：再估计需要多少并行任务</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">ext_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="o">/</span> <span class="mf">64.0</span>
+<span class="n">ext_device_core_count</span> <span class="o">=</span> <span class="nf">int</span><span class="p">(</span><span class="n">device_core_count</span> <span class="o">*</span> <span class="nf">max</span><span class="p">(</span><span class="nf">log2</span><span class="p">(</span><span class="n">ext_seq_len</span><span class="p">),</span> <span class="mf">1.0</span><span class="p">))</span>
+</code></pre></div></div>
+
+<p>这里的 <code class="language-plaintext highlighter-rouge">ext_device_core_count</code> 是经过长度放大的<strong>启发式并行任务预算</strong>，不是硬件真的增加了核心。源码注明希望拆分数随序列长度逐渐增长。这不是实测延迟模型。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">num_kv_group</span> <span class="o">=</span> <span class="n">num_head</span> <span class="o">//</span> <span class="n">num_kv_head</span>
+<span class="k">if</span> <span class="n">num_kv_group</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="n">token_grid</span> <span class="o">=</span> <span class="n">num_seq</span> <span class="o">*</span> <span class="n">num_group</span> <span class="o">*</span> <span class="n">num_head</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">block_h</span> <span class="o">=</span> <span class="nf">min</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">num_kv_group</span><span class="p">)</span>
+    <span class="n">token_grid</span> <span class="o">=</span> <span class="n">num_seq</span> <span class="o">*</span> <span class="n">num_group</span> <span class="o">*</span> <span class="nf">ceil_div</span><span class="p">(</span><span class="n">num_head</span><span class="p">,</span> <span class="n">block_h</span><span class="p">)</span>
+</code></pre></div></div>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">num_kv_group</code> 是每个 KV head 对应多少 query heads，即 GQA/MQA 的 head 共享比例。</li>
+  <li><code class="language-plaintext highlighter-rouge">block_h</code> 在此表示分组路径一起处理的 query head 数，最大取 16；不是 KV 段长。</li>
+  <li><code class="language-plaintext highlighter-rouge">token_grid</code> 估计未沿 KV 拆分时，序列、执行条目与 head 分组已经提供多少任务。</li>
+</ul>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">max_kv_splits_2</span> <span class="o">=</span> <span class="nf">min</span><span class="p">(</span><span class="nf">ceil_div</span><span class="p">(</span><span class="n">ext_device_core_count</span><span class="p">,</span> <span class="n">token_grid</span><span class="p">),</span> <span class="n">max_kv_splits</span><span class="p">)</span>
+<span class="n">kv_chunk_size_2</span> <span class="o">=</span> <span class="nf">ceil_div</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="n">max_kv_splits_2</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>现有任务多时，为满足该启发式预算所需的额外拆分通常较少；现有任务少时，可能沿 KV 增加拆分。这个趋势受另一分支、上限和离散取整共同影响，不是严格的 batch size 与 split 数反比例规律。</p>
+
+<h2 id="5-合并两个提议与数值例子">5. 合并两个提议与数值例子</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">num_kv_splits</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nf">max</span><span class="p">(</span>
+    <span class="nf">ceil_div</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">kv_chunk_size_1</span><span class="p">),</span>
+    <span class="nf">ceil_div</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">kv_chunk_size_2</span><span class="p">),</span>
+<span class="p">)</span>
+</code></pre></div></div>
+
+<p>最后通过 <code class="language-plaintext highlighter-rouge">offs_token = offs_seq * num_group</code> 将每个序列的份数写入对应输出位置；<code class="language-plaintext highlighter-rouge">num_group &gt; 1</code> 时重复写入各展开条目。</p>
+
+<p>使用以下明确假设做算术演示，不代表某个实际 NPU：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>seq_lens         = [1024, 1024, 8192]
+num_seq          = 3
+num_group        = 1
+num_head         = 32
+num_kv_head      = 8
+device_core_count= 80
+max_kv_splits    = 16
+</code></pre></div></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>步骤</th>
+      <th>计算结果</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>长度差异提议</td>
+      <td><code class="language-plaintext highlighter-rouge">splits_1=8</code>，<code class="language-plaintext highlighter-rouge">chunk_1=1024</code>，各请求提议 <code class="language-plaintext highlighter-rouge">[1,1,8]</code></td>
+    </tr>
+    <tr>
+      <td>长度放大预算</td>
+      <td><code class="language-plaintext highlighter-rouge">log2(8192/64)=7</code>，启发式预算 <code class="language-plaintext highlighter-rouge">80*7=560</code></td>
+    </tr>
+    <tr>
+      <td>现有并行任务</td>
+      <td>GQA 比例 <code class="language-plaintext highlighter-rouge">32/8=4</code>，<code class="language-plaintext highlighter-rouge">block_h=4</code>，<code class="language-plaintext highlighter-rouge">token_grid=3*1*ceil(32/4)=24</code></td>
+    </tr>
+    <tr>
+      <td>利用率提议</td>
+      <td><code class="language-plaintext highlighter-rouge">splits_2=min(ceil(560/24),16)=16</code>，<code class="language-plaintext highlighter-rouge">chunk_2=512</code>，各请求提议 <code class="language-plaintext highlighter-rouge">[2,2,16]</code></td>
+    </tr>
+    <tr>
+      <td>最终逐请求份数</td>
+      <td>取逐项最大值，得到 <code class="language-plaintext highlighter-rouge">[2,2,16]</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>以上数字已用独立 Python 整数运算核对，没有执行原 Triton kernel 或测量性能。此前 <code class="language-plaintext highlighter-rouge">[1,1,8]</code> 只描述长度差异这一项，在本组完整假设下不是最终结果。</p>
+
+<h2 id="6-规划份数怎样变成实际计算范围">6. 规划份数怎样变成实际计算范围</h2>
+
+<p>普通 stage 1 使用：</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">kv_len_per_split</span> <span class="o">=</span> <span class="nf">ceil_div</span><span class="p">(</span><span class="nf">ceil_div</span><span class="p">(</span><span class="n">L</span><span class="p">,</span> <span class="n">S</span><span class="p">),</span> <span class="n">MIN_BLOCK_KV</span><span class="p">)</span> <span class="o">*</span> <span class="n">MIN_BLOCK_KV</span>
+<span class="n">start</span> <span class="o">=</span> <span class="n">kv_len_per_split</span> <span class="o">*</span> <span class="n">split_id</span>
+<span class="n">end</span> <span class="o">=</span> <span class="nf">min</span><span class="p">(</span><span class="n">start</span> <span class="o">+</span> <span class="n">kv_len_per_split</span><span class="p">,</span> <span class="n">L</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>其中 L 是该执行条目的实际 KV 长度，S 是规划份数；本代码的 <code class="language-plaintext highlighter-rouge">_MIN_BLOCK_KV</code> 为 32。<code class="language-plaintext highlighter-rouge">end &gt; start</code> 的任务才计算。每个 split 内还按 <code class="language-plaintext highlighter-rouge">BLOCK_N</code> 读取 tile，后者是另一层访存/计算粒度。</p>
+
+<p>举例：L=1025，目标 <code class="language-plaintext highlighter-rouge">split_tile_size=256</code>，包装函数给出 S=5。普通 stage 1 得到实际每段范围大小 <code class="language-plaintext highlighter-rouge">ceil_div(ceil_div(1025,5),32)*32=224</code>，边界为 <code class="language-plaintext highlighter-rouge">[0,224)</code>、<code class="language-plaintext highlighter-rouge">[224,448)</code>、<code class="language-plaintext highlighter-rouge">[448,672)</code>、<code class="language-plaintext highlighter-rouge">[672,896)</code>、<code class="language-plaintext highlighter-rouge">[896,1025)</code>。所以目标段长、实际 split 范围、KV page size 和内部 tile 都不是同一个变量。</p>
+
+<p>普通非分组路径的 stage 1 launch grid 是 <code class="language-plaintext highlighter-rouge">(batch, head_num, MAX_KV_SPLITS)</code>，可能包含无有效 KV 范围的任务；不是只按各请求有效 split 数紧凑启动。stage 2 grid 为 <code class="language-plaintext highlighter-rouge">(batch, head_num)</code>，汇总局部输出与归一化信息。GQA 分组和其他实现的 grid 应分别核对，不能用普通路径公式替代它们。</p>
+
+<h2 id="7-attention-和-ffn-为什么不要求相同并行度">7. attention 和 FFN 为什么不要求相同并行度</h2>
+
+<p>并行任务是各算子内部的实现单位，跨算子契约是输出张量及完成依赖。不存在“整个 forward 固定给一个请求分配若干核心，并一直持有”的要求。</p>
+
+<p>以三个 decode token、hidden size H、FFN 中间维度 I 为例，忽略 TP 与图 padding：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>QKV 投影：输入 [3,H]
+  ↓
+Attention：沿 请求/head/KV split 组织局部任务
+  ↓ 合并 split，恢复每个 query/head 的完整输出
+Attention 输出投影：[3,H]
+  ↓
+FFN gate/up 投影：[3,H] × [H,2I] → [3,2I]
+门控激活：[3,2I] → [3,I]
+FFN down 投影：[3,I] × [I,H] → [3,H]
+</code></pre></div></div>
+
+<p>这是 Qwen2 普通数学形状示意，权重在 PyTorch 中可能以转置布局存储，实际实现也可能融合 gate/up 与激活等步骤。</p>
+
+<p>FFN 不只有三个硬件任务：矩阵乘法还能沿输出通道分 tile。概念上 <code class="language-plaintext highlighter-rouge">[M,K] × [K,N]</code> 的输出 tile 网格可按 <code class="language-plaintext highlighter-rouge">ceil(M/BM) × ceil(N/BN)</code> 组织，具体 kernel 还可能采用分组、persistent 或 split-K 等策略。因此 M=3 不等于只使用三个核心，attention 的 split 数也无需与 FFN tile 数相等。</p>
+
+<p>普通独立算子链通过 stream 顺序/事件等依赖保证后续读取的数据已就绪；不同 kernel 启动时各自调度任务。图模式或融合实现可能改变提交细节，但仍需满足张量依赖。split 归并不是为了让两种算子的任务数一样，而是为了恢复正确的 attention 输出。</p>
+
+<p>attention 与 FFN 的设备利用率仍可能不同，split-KV 只改善 attention。若 FFN 成为瓶颈，应分析其 batch/token 数、矩阵形状、权重带宽、dtype 与 kernel，而不是为它保留无意义的 KV split 槽位。整体 forward 性能应按各算子实际依赖和代价组成，不按某个统一“并行度”比例推算。</p>
+
+<p>关联：<a href="/sglang/architecture/attention-parallelism-and-batch-pipeline.html">分块与流水概念</a>、<a href="/sglang/features/01-requests-and-scheduling.html">请求与调度</a>。</p>
+
+
+      <footer class="site-footer">
+        
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a>.</span>
+      </footer>
+    </main>
+  </body>
+</html>

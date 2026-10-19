@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+
+<!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>请求、batch 与调度主循环 | lukeayin’s blog</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="请求、batch 与调度主循环" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="description" content="Qwen2 prefill/decode、请求与 batch、KV 位置和调度主循环" />
+<meta name="twitter:description" property="og:description" content="Qwen2 prefill/decode、请求与 batch、KV 位置和调度主循环" />
+<meta property="og:site_name" content="lukeayin’s blog" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="请求、batch 与调度主循环" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"Qwen2 prefill/decode、请求与 batch、KV 位置和调度主循环","headline":"请求、batch 与调度主循环","url":"/sglang/features/01-requests-and-scheduling.html"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link rel="preload" href="https://fonts.googleapis.com/css?family=Open+Sans:400,700&display=swap" as="style" type="text/css" crossorigin>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#157878">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <a id="skip-to-content" href="#content">Skip to the content.</a>
+
+    <header class="page-header" role="banner">
+      <h1 class="project-name">请求、batch 与调度主循环</h1>
+      <h2 class="project-tagline">Qwen2 prefill/decode、请求与 batch、KV 位置和调度主循环</h2>
+      
+      
+    </header>
+
+    <main id="content" class="main-content" role="main">
+      <h1 id="请求batch-与调度主循环">请求、batch 与调度主循环</h1>
+
+<p>状态：学习中，第一讲覆盖普通文本生成主路径；准入预算细节、回退和取消待继续学习。
+源码基线：<code class="language-plaintext highlighter-rouge">0957288be0818686034f33a3a7441434e4f5ba33</code>，核对日期：2026-10-19。
+验证方式：源码阅读与手工推演，未运行模型或仿真实验。</p>
+
+<p>对应架构：<a href="/sglang/architecture/01-scheduler-loop.html">调度循环与模型执行</a>。</p>
+
+<h2 id="1-本讲配置与符号">1. 本讲配置与符号</h2>
+
+<p>用 Qwen2 风格的 decoder-only 模型解释普通自回归生成。假设单 rank、关闭 overlap 和投机解码，无前缀命中，内存充足，prompt 不分块，关闭 prefill/decode 混合，无额外 prefill 延迟策略。这里只分析生成路径，不包括 embedding、beam search、多模态与 PD 分离。</p>
+
+<p>以下 token 用抽象符号表示，不假定一个汉字等于一个 token，也不代表某组真实权重的实际输出。位置从 0 开始。H 表示 hidden size，V 表示词表大小。</p>
+
+<h2 id="2-三类关键对象">2. 三类关键对象</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>对象或状态</th>
+      <th>职责</th>
+      <th>本讲关注内容</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">Req</code></td>
+      <td>一次生成请求的长期状态</td>
+      <td><code class="language-plaintext highlighter-rouge">origin_input_ids</code>、<code class="language-plaintext highlighter-rouge">output_ids</code>、采样/停止参数、KV 相关状态</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">ScheduleBatch</code></td>
+      <td>一组请求某次执行的组织方式</td>
+      <td><code class="language-plaintext highlighter-rouge">reqs</code>、<code class="language-plaintext highlighter-rouge">forward_mode</code>、输入 token、序列长度、扩展长度与 KV 写入位置</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">waiting_queue</code></td>
+      <td>等待被调度的请求</td>
+      <td>调度器从中选择可准入的请求，也可能包含被回退的请求</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">running_batch</code></td>
+      <td>持续生成请求的工作集合</td>
+      <td>在后续 decode 继续执行；成员会合并或过滤，不是永远固定的 batch</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">last_batch</code></td>
+      <td>上次提交的 batch</td>
+      <td>用于 prefill 之后的合并等跨轮协调；不能当作“所有历史请求”</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>请求经过多轮执行产生多个输出 token。batch 是当前执行单位；多请求可以共享同一次模型执行，但各自的上下文、KV 索引和结束状态独立。</p>
+
+<h2 id="3-从请求到-prefill">3. 从请求到 prefill</h2>
+
+<p>文本经 tokenizer 转为 token ID，Scheduler 接收已分词请求。普通请求的 <code class="language-plaintext highlighter-rouge">handle_generate_request()</code> / <code class="language-plaintext highlighter-rouge">_handle_generate_request()</code> 创建 <code class="language-plaintext highlighter-rouge">Req</code>，经相应路径进入待调度队列。</p>
+
+<p><code class="language-plaintext highlighter-rouge">get_next_batch_to_run()</code> 在本讲配置下先尝试构造可运行的 prefill batch；<code class="language-plaintext highlighter-rouge">PrefillAdder</code> 等逻辑检查预算和容量。不是队列里有多少请求就全部执行。没有可执行 prefill 时，才尝试推进 running batch 的 decode。</p>
+
+<p>被选中的请求通过 <code class="language-plaintext highlighter-rouge">ScheduleBatch.init_new()</code> 组成 batch，再调用 <code class="language-plaintext highlighter-rouge">prepare_for_extend()</code>：</p>
+
+<ul>
+  <li>设定 <code class="language-plaintext highlighter-rouge">ForwardMode.EXTEND</code>。</li>
+  <li>从各请求取待计算部分：<code class="language-plaintext highlighter-rouge">r.get_fill_ids()[r.prefix_len:]</code>。</li>
+  <li>汇总 <code class="language-plaintext highlighter-rouge">extend_num_tokens</code>，构造长度信息并准备扁平化 token 输入。</li>
+  <li><code class="language-plaintext highlighter-rouge">alloc_for_extend()</code> 分配本轮所需的 KV 写入位置。</li>
+</ul>
+
+<p>本讲无缓存命中，因此待计算部分就是全部 prompt。一般情形下，EXTEND 也可能处理未命中的后缀或一个 prefill chunk，不能一律理解为重新计算全部 prompt。</p>
+
+<h2 id="4-结合-qwen2-看第一次模型执行">4. 结合 Qwen2 看第一次模型执行</h2>
+
+<p>请求 A 的 prompt 为 <code class="language-plaintext highlighter-rouge">[p0, p1, p2, p3]</code>，最多生成 3 个 token。</p>
+
+<p>一次完整 prefill 的逻辑计算：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>input_ids [4]，positions [0, 1, 2, 3]
+    → Embedding：hidden_states [4, H]
+    → 逐个 decoder layer
+        → 归一化与残差处理
+        → QKV 投影 → Q/K 的 RoPE
+        → causal attention，并保存本层输入位置的 K/V
+        → 输出投影、归一化/残差、MLP
+    → 最终归一化
+    → LogitsProcessor / LM head
+    → 本请求末尾位置的 next-token logits [1, V]
+    → 按采样参数选择第一个输出 token a1
+</code></pre></div></div>
+
+<p>这是语义图，不表示每个方框都是独立设备 kernel；归一化/残差等可能经 boundary 或融合实现。</p>
+
+<p>prefill 能一起处理已知 prompt 的多个位置。因果 attention 保证位置 i 只使用允许的历史位置，不会让未来 token 泄漏。各位置输出的作用是预测其后续 token；普通生成取 prompt 最后一个位置的 logits 来产生 a1。</p>
+
+<p>源码对应：<code class="language-plaintext highlighter-rouge">Qwen2Model.forward()</code> 执行 embedding、decoder layers 与 final norm；<code class="language-plaintext highlighter-rouge">Qwen2Attention.forward()</code> 执行 QKV 投影、RoPE、<code class="language-plaintext highlighter-rouge">RadixAttention</code> 和输出投影；<code class="language-plaintext highlighter-rouge">Qwen2ForCausalLM.forward()</code> 调用 logits processor。无额外 logprob 等要求的普通 extend 路径会按各请求的最后位置选择 hidden state，避免将每个 prompt 位置都当作新的生成结果。</p>
+
+<p>KV Cache 保存各层的 K/V，用于下一轮 attention；不是保存“下一次输出答案”，也不意味着后续无需执行所有层。</p>
+
+<h2 id="5-decode-为什么只输入一个-token">5. decode 为什么只输入一个 token</h2>
+
+<p>prefill 已产生 a1，但它此时只是采样出的 ID，还没有作为模型输入通过各层。下一轮输入 a1，才生成 a1 对应的各层 K/V，并据此预测 a2。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>模型执行</th>
+      <th>新输入</th>
+      <th>本轮输入位置</th>
+      <th>各层可用的 KV 位置数（计算后、释放前）</th>
+      <th>新输出</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>prefill</td>
+      <td>p0、p1、p2、p3</td>
+      <td>0、1、2、3</td>
+      <td>4</td>
+      <td>a1</td>
+    </tr>
+    <tr>
+      <td>decode 1</td>
+      <td>a1</td>
+      <td>4</td>
+      <td>5</td>
+      <td>a2</td>
+    </tr>
+    <tr>
+      <td>decode 2</td>
+      <td>a2</td>
+      <td>5</td>
+      <td>6</td>
+      <td>a3</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>表中 KV 数量表示该请求在每层的逻辑位置数，不是显存字节或跨层总量。若 a3 达到长度上限，请求就结束，不必再输入 a3 做一次 forward。</p>
+
+<p>decode 同样通过 embedding 和所有 decoder layers。区别是本轮只为一个新输入位置计算 Q/K/V，attention 的 Q 是新位置，而 K/V 包含缓存的历史与当前新位置。因此输入 token 数很少，attention 仍需读取历史上下文；相同 decode batch size、不同上下文长度的代价可能不同。</p>
+
+<h3 id="为什么历史长度影响-decode-attention-的工作量">为什么历史长度影响 decode attention 的工作量</h3>
+
+<p>用户提出：每轮只计算新 token 的 K/V，是否因为历史 KV 数量不同，导致 Q 与 KV 的计算量不同？对普通全量 causal attention，理解正确；具体包含 Q 与所有可见 K 的打分，以及按分数对所有可见 V 加权求和。</p>
+
+<p>以一层的一个 attention head 为例，设已经缓存 L 个历史位置，当前新增一个输入位置，head dimension 为 d，且 Q/K/V 的 head dimension 相同。以下形状为数学视图，不要求设备实际拼接成连续张量：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>当前输入投影：q_new [1, d]，k_new [1, d]，v_new [1, d]
+历史加当前：K_all [L+1, d]，V_all [L+1, d]
+
+scores  = q_new @ K_all.T / sqrt(d)     # [1, L+1]
+weights = softmax(scores)              # [1, L+1]
+output  = weights @ V_all              # [1, d]
+</code></pre></div></div>
+
+<p>Q/K 可在打分前应用 RoPE；这里省略了位置处理与其他实现细节，聚焦序列长度维度。</p>
+
+<ul>
+  <li>新 Q/K/V 的投影只处理当前 token，在固定模型与 batch 条件下，其矩阵规模不随 L 增长。</li>
+  <li>QK 打分需要与 L+1 个 key 计算点积；加权求和需要处理 L+1 个 value，二者算术工作量均为 O((L+1)d)，softmax 为 O(L+1)。</li>
+  <li>KV Cache 避免重新计算历史 K/V，但这些历史 K/V 仍参与当前 attention，需要被读取。</li>
+  <li>输出始终是 <code class="language-plaintext highlighter-rouge">[1, d]</code>，输出形状相同不代表内部计算量相同。</li>
+</ul>
+
+<p>例如总可见 KV 长度分别为 1,024 和 8,192 时，一个 head 分别需要 1,024 和 8,192 个打分项，并对相应数量的 V 加权；这部分的算术规模约差 8 倍。整个 decode 步骤还包括投影、MLP 等工作，实际时延也取决于带宽、并行和 kernel 实现，不能据此断言整轮慢 8 倍。</p>
+
+<p>此分析针对普通全量 attention。滑动窗口、稀疏 attention 应按实际访问的 KV 位置计算；线性 attention 使用不同计算形式。GQA/MQA 改变 KV head 数与共享关系，但不消除普通 attention 中对可见序列位置的访问。因此性能代价查询应记录 attention 类型、新 query 数、实际可见 KV 长度、head 数/维度和 dtype 等信息。</p>
+
+<p><code class="language-plaintext highlighter-rouge">prepare_for_decode()</code> 在普通路径设定 <code class="language-plaintext highlighter-rouge">DECODE</code>，通过 <code class="language-plaintext highlighter-rouge">alloc_for_decode(..., token_per_req=1)</code> 为每个请求申请新位置，并增加序列长度。输入来自前次执行结果的传递路径；此函数不重新计算整个历史 prompt。</p>
+
+<h2 id="6-执行结果如何回到真实状态">6. 执行结果如何回到真实状态</h2>
+
+<p><code class="language-plaintext highlighter-rouge">TpModelWorker.forward_batch_generation()</code> 将 batch 转为 <code class="language-plaintext highlighter-rouge">ForwardBatch</code>，调用 <code class="language-plaintext highlighter-rouge">ModelRunner.forward()</code> 得到 logits，再在本讲普通非 overlap 路径采样 <code class="language-plaintext highlighter-rouge">next_token_ids</code>。</p>
+
+<p>Scheduler 的 <code class="language-plaintext highlighter-rouge">process_batch_result()</code> 根据模式分派到 <code class="language-plaintext highlighter-rouge">batch_result_processor</code>。普通 prefill 的结果处理会追加输出 token，调用 <code class="language-plaintext highlighter-rouge">Req.update_finish_state()</code>，并根据是否结束处理 KV 生命周期；decode 也会提交生成结果并检查结束状态。</p>
+
+<p>结束条件包括长度上限、EOS/停止规则等，具体受请求参数影响。没结束的请求继续参与后续执行；结束请求经结果处理和后续过滤退出活动集合。释放请求不等于所有 KV 立即成为空闲，可能保留为可复用的前缀缓存。</p>
+
+<p>普通场景下，prefill 后仍在生成的请求会在下一次 <code class="language-plaintext highlighter-rouge">get_next_batch_to_run()</code> 中从 last batch 合并到 running batch。这个状态转换在真实调度中完成，不由仿真代码预先安排。</p>
+
+<h2 id="7-两个请求如何连续组-batch">7. 两个请求如何连续组 batch</h2>
+
+<p>仍用上述配置。A 的 prompt 长度为 4，输出长度为 3；B 的 prompt 长度为 3，输出长度为 2。没有提前 EOS；B 在 A 的 prefill 期间到达，并在下一轮接收时可见。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>轮次</th>
+      <th>调度选择</th>
+      <th>本轮实际新输入</th>
+      <th>输出</th>
+      <th>状态变化</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>A prefill</td>
+      <td>A 的 4 个 prompt token</td>
+      <td>a1</td>
+      <td>A 等待后续生成</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>B prefill</td>
+      <td>B 的 3 个 prompt token</td>
+      <td>b1</td>
+      <td>A 本轮未 decode；B 随后可并入 running batch</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>A、B decode</td>
+      <td><code class="language-plaintext highlighter-rouge">[a1, b1]</code>，两个 token</td>
+      <td>a2、b2</td>
+      <td>B 达到 2 个输出，结束</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>A decode</td>
+      <td><code class="language-plaintext highlighter-rouge">[a2]</code>，一个 token</td>
+      <td>a3</td>
+      <td>A 达到 3 个输出，结束</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>这是在明确假设下的源码推演，不是运行日志或所有配置的固定结果。prefill 延迟、混合批次、chunked prefill、内存不足和 overlap 都可能改变顺序。</p>
+
+<p>第 3 轮的两个新 token 可组成 <code class="language-plaintext highlighter-rouge">[2, H]</code> 的 hidden states，通过同一套模型权重计算。A 的 attention 使用 A 的上下文，B 使用 B 的上下文；batch 元数据与 KV 索引区分请求，不会把它们当成一条相互可见的序列。</p>
+
+<p>连续批处理允许新请求在执行过程中加入、结束请求退出。batch size 因而是每轮的运行结果，不能在性能模型中假定永远不变。</p>
+
+<h2 id="8-对性能仿真的直接要求">8. 对性能仿真的直接要求</h2>
+
+<ul>
+  <li>真实调度决定上表的 batch 成员、执行模式和资源变化；仿真不能直接写死这张时间表。</li>
+  <li>代价输入至少要区分新计算 token 数与各请求历史长度；只看请求数不足以刻画 prefill/decode 工作量。</li>
+  <li>操作耗时来自打桩表，但请求到达、执行完成、结果可见时机必须反馈到真实调度。</li>
+  <li>a1/a2 等结果可以由执行端约定的机制提供，但必须通过真实结果处理与结束判断；不能直接将请求改成“已完成”。</li>
+  <li>本讲未核对具体 NPU kernel 列表、真实性能、异步事件适配或完整服务端计时范围。</li>
+</ul>
+
+<h3 id="不同-kv-长度与-batch-内工作量不均衡">不同 KV 长度与 batch 内工作量不均衡</h3>
+
+<p>性能模型需要评估不同 KV 长度造成的 forward 耗时差异，但预测单位通常应是实际批量执行的算子及整个 batch，而不是先得到各请求独立 forward 耗时再相加或取最大值。</p>
+
+<p>普通 dense 模型的 decode 中，每个请求本轮提供一个新 token。固定模型、dtype 和并行配置时，投影与 MLP 的主要矩阵形状由本轮 token 数决定；attention 还取决于每个请求的可见 KV 长度。MoE、图模式和其他配置会增加额外因素。</p>
+
+<p>例：一个 decode batch 的可见 KV 长度为 <code class="language-plaintext highlighter-rouge">[1024, 1024, 8192]</code>。三个 query 的逻辑打分项总数为 <code class="language-plaintext highlighter-rouge">10240</code>（按一个 query head 计）；如果按最大长度完整 padding 后都计算，形状规模会是 <code class="language-plaintext highlighter-rouge">3 × 8192 = 24576</code>。这是两种工作量视图，不代表当前后端一定执行其中某个精确数量。实际 kernel 会涉及分块、对齐、mask、共享、padding 和工作分配。</p>
+
+<p>项目已有表示不同请求长度的接口：<code class="language-plaintext highlighter-rouge">ForwardBatch.seq_lens</code> 等字段携带长度信息，Ascend attention 后端维护序列长度和 block table，并在相应算子调用中传入实际长度。接口支持逐请求长度不等于已经证明 kernel 的负载完全均衡，也不能据此推断它一定没有 padding 或额外开销。</p>
+
+<p>“平衡”需要分三个层面理解：</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>层面</th>
+      <th>谁负责</th>
+      <th>对我们当前方案的要求</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>组 batch：哪些长短请求放在一起</td>
+      <td>真实 Scheduler 与既有策略</td>
+      <td>保留真实决定，不在仿真器里重新按长度组批</td>
+    </tr>
+    <tr>
+      <td>批量算子内部：任务如何分到设备执行单元</td>
+      <td>具体 kernel、编译/运行时和硬件</td>
+      <td>耗时模型应反映并行利用率、分块和尾部工作；没有数据时只能显式作假设</td>
+    </tr>
+    <tr>
+      <td>性能建模：怎样表达不均衡</td>
+      <td>算子/执行代价提供器</td>
+      <td>保留每请求长度，建模整个调用的完成时间，不把平均长度当作唯一特征</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>kernel 可以采用按请求/head 分工、按 KV 块拆分长请求、合并部分结果等方式利用并行资源；这些是可能的机制，不是本次已核对的 Ascend kernel 内部实现。少数长任务也可能造成执行尾部拖延。多个请求共享设备资源，因此 batch 延迟通常不等于独立请求延迟的和，也不等于独立延迟的最大值。</p>
+
+<p>即使 <code class="language-plaintext highlighter-rouge">[1024, 1024, 8192]</code> 和 <code class="language-plaintext highlighter-rouge">[3072, 3072, 4096]</code> 的总长度与平均长度相同，长度分布也不同，在不同 kernel 的分工策略下可能产生不同利用率和耗时；不能仅由分布推断哪一组必然更快。</p>
+
+<p>当前耗时打桩的建议：</p>
+
+<ul>
+  <li>输入保留每请求 <code class="language-plaintext highlighter-rouge">query_len</code>、<code class="language-plaintext highlighter-rouge">kv_len</code>，以及 attention 类型、head 信息、dtype、后端、并行/图模式。字段含义必须明确 KV 长度是否包含本轮新位置。</li>
+  <li>规则可以先使用总可见长度、最大长度和 batch size，表达总工作量与可能的尾部效应；完整长度列表继续记录，便于未来增加分桶、tile 数和实测匹配。</li>
+  <li>若用 <code class="language-plaintext highlighter-rouge">固定开销 + α × 总长度 + β × 最大长度</code> 之类规则，仅将其视为合成实验参数，不能当作 NPU 的物理规律或校准模型。</li>
+  <li>为每个实际批量算子调用返回一个代价，再按真实执行依赖组合成 forward 时间；不要对整轮 forward 和内部算子重复计时。</li>
+  <li>普通 batch 结果处理受批量执行与结果可见事件约束，短请求不能仅凭其较小的独立工作量就提前提交该轮 token。它仍可在真实结束条件满足后退出后续 batch。</li>
+</ul>
+
+<p>如果未来研究按长度分桶、限制单 batch 长度差异等优化，应作为真实调度策略的独立变更评估，同时考虑排队、公平性与吞吐，不能悄悄加进基准仿真路径。当前优先复现原有策略下的不均衡及其影响。</p>
+
+<p>后续源码核对已确认仓库内 Triton decode attention 的 split-KV 两阶段实现；Ascend 调用位置只能确认实际长度与页表的传递，未确认 NPU 算子内部的分核方式。相关区别及其与流水 batch 的关系见 <a href="/sglang/architecture/attention-parallelism-and-batch-pipeline.html">KV 分块、算子并行与 batch 流水</a>。</p>
+
+<h3 id="不同请求每次自回归时间是否被调平">不同请求每次自回归时间是否被“调平”</h3>
+
+<p>普通批量 decode 不会给每个请求启动一个独立、可以按各自速度无限前进的完整模型执行。输入 token 一起通过批量算子链，得到整批结果；请求间的工作量差异由实际算子实现承接。</p>
+
+<p>因此，同一 batch 中短请求与长请求的 attention 工作量可以不同，但 token 结果处理通常共享这一批的完成边界。<code class="language-plaintext highlighter-rouge">BatchResultProcessor.process_batch_result_decode()</code> 若存在 <code class="language-plaintext highlighter-rouge">copy_done</code> 则先同步该事件，随后归一化批量输出、逐请求追加 token 和判断结束，最后调用 <code class="language-plaintext highlighter-rouge">stream_output(batch.reqs, ...)</code>。这不是逐请求独立完成就立即进入下一次 forward 的执行模型。CPU 处理、流式输出间隔和网络会使客户端实际可见时间不同，不能保证所有请求严格同时收到 token。</p>
+
+<p>需要区分三种时间：</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>时间</th>
+      <th>含义</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>单请求独立运行的 decode 耗时</td>
+      <td>在特定上下文、配置和资源条件下单独执行的基准值，不可直接当作混合 batch 内该请求的耗时</td>
+    </tr>
+    <tr>
+      <td>batch 执行耗时</td>
+      <td>共享设备资源、批量算子形状与执行依赖共同产生的结果</td>
+    </tr>
+    <tr>
+      <td>某请求相邻输出 token 的间隔</td>
+      <td>还包含它等待再次被调度、相关执行完成、结果处理及选定观测边界内的输出开销</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>SGLang 的处理方式是提高批量执行效率并管理调度机会，而不是保证所有请求自回归延迟相等：</p>
+
+<ul>
+  <li>算子级并行（如某些后端的 split-KV）改善长请求的执行利用率，但不保证长短请求完全无相互影响。</li>
+  <li>连续批处理会移除已完成请求并接纳新请求；短输出请求不必等其他请求整段生成结束。</li>
+  <li>按配置使用 chunked prefill、混合批次或 prefill/decode 节奏控制，可限制长 prefill 对正在 decode 请求的干扰；并不消除长上下文 decode 的 KV 读取量。</li>
+  <li>waiting queue 的 <code class="language-plaintext highlighter-rouge">SchedulePolicy.calc_priority()</code> 支持多种排队策略，当前代码可见 FCFS、LPM、HRRN、shortest-prefill-first 等；它们影响准入机会或复用/排队表现，不等价于按每请求 decode 毫秒数分配资源。其具体行为与权衡尚未深入。</li>
+  <li>overlap 减少主机与设备之间的空隙，不能让一个请求跳过模型结果依赖，也不自动提供时延隔离。</li>
+</ul>
+
+<p>本版本还可见 <code class="language-plaintext highlighter-rouge">_should_defer_prefill()</code> / <code class="language-plaintext highlighter-rouge">_arm_prefill_decode_interval()</code> 对 prefill/decode 节奏的控制。这里只确认机制存在，不宣称所有配置默认启用或自动提供延迟保障。</p>
+
+<p>仿真应让真实调度决定每轮 batch，对该 batch 预测耗时，并在真实结果可见时点记录每个请求的 token 时间；最后计算逐请求 token 间隔及分位数。不能预先将各请求时间平均，也不能直接用单请求基准的最大值代表 batch 延迟。</p>
+
+<h3 id="排队与准入究竟缓解了什么">排队与准入究竟缓解了什么</h3>
+
+<p>此前“排队策略缓解不均衡”应限定含义：它们主要控制请求等待、批次组成和资源压力，不直接消除已经进入同一个 decode batch 的长短 KV 计算差异，也不默认把请求按预测 decode 耗时分桶。</p>
+
+<p><code class="language-plaintext highlighter-rouge">SchedulePolicy.calc_priority()</code> 决定等待队列的候选顺序，<code class="language-plaintext highlighter-rouge">PrefillAdder.add_one_req()</code> 及 <code class="language-plaintext highlighter-rouge">_select_prefill_admission()</code> 决定候选能否以什么 prefill 形状加入。两个层次不能混为“自动负载均衡”。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>已核对机制</th>
+      <th>可以改善的情形</th>
+      <th>不保证的效果</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>shortest-prefill-first</td>
+      <td>按未缓存的待计算输入规模排序，让小 prefill 有机会先执行；本版本还有为较短请求保留 chunk 预算的逻辑</td>
+      <td>不能保证后续 decode 的上下文短或时间相同；短请求持续到达时需关注公平性</td>
+    </tr>
+    <tr>
+      <td>LPM</td>
+      <td>优先较长前缀匹配，利用已有 KV，减少重复 prefill</td>
+      <td>复用的历史 KV 在普通全量 decode attention 中仍被读取，命中多不代表 decode 便宜</td>
+    </tr>
+    <tr>
+      <td>HRRN</td>
+      <td>使用 token 进度表达等待老化，结合未缓存输入量考虑排队顺序</td>
+      <td>不是精准的每请求毫秒代价模型，也不是 decode 时延隔离</td>
+    </tr>
+    <tr>
+      <td>请求数、输入 token、内存等准入约束</td>
+      <td>控制本轮或活动集合的规模，降低资源过载和内存压力；被延迟请求仍承担排队等待</td>
+      <td>不保证每轮严格限定在某个毫秒预算内，也不等于按 KV 长度差分组</td>
+    </tr>
+    <tr>
+      <td>chunked prefill / 混合批次</td>
+      <td>按配置限制长 prompt 一次提交的新 token 数、为其他工作留下调度机会</td>
+      <td>一个 chunk 仍可能读取较长前缀；不能仅由 chunk token 数推断精确耗时</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>预算例子：等待队列有一个需计算 8K 新 token 的请求和一个 1K 请求。shortest-prefill-first 可把 1K 请求先作为候选；若启用 2K chunk 预算，长请求在相应条件下分块进入。这样控制的是排队顺序和每轮提交量，不是将 8K 上下文的 decode 变成 1K 上下文的计算量。具体接纳组合仍取决于其他预算、对齐和策略。</p>
+
+<p>源码中特别存在例外：未启用 chunking 时，<code class="language-plaintext highlighter-rouge">_select_prefill_admission()</code> 可允许首个请求超过 input cap。因此不能把所有 token 预算描述为每个配置下都不可突破的硬上限。</p>
+
+<p>应按三类问题分别判断：队头等待/准入压力由调度处理；设备内任务长短差异由算子分工处理；跨批次的主机/设备空隙由 overlap 等机制处理。某种优化改善吞吐，也可能增加个别请求的排队，须用逐请求时延与整体吞吐共同评估。</p>
+
+<p>各 policy 的默认选择、排序例子、适用场景推导和显式降级已单独整理为 <a href="/sglang/features/scheduling-policies.html">排队策略的选择与降级</a>。</p>
+
+<h3 id="第一阶段总结校正调度粒度与-split-kv-的作用范围">第一阶段总结校正：调度粒度与 split-KV 的作用范围</h3>
+
+<p>用户提出三点总结后，核对并明确以下结论：</p>
+
+<ol>
+  <li><code class="language-plaintext highlighter-rouge">fcfs</code>、<code class="language-plaintext highlighter-rouge">lpm</code>、<code class="language-plaintext highlighter-rouge">hrrn</code> 等属于等待队列的<strong>排队策略</strong>：决定先考虑哪个候选。<strong>准入检查</strong>在候选排序后判断请求数、token、KV 和其他约束，决定是否接纳及是否分块；两者共同形成 batch，不能统称为上述 policy。</li>
+  <li>普通自回归生成以<strong>迭代</strong>为调度机会。一次普通 decode forward 通常为每个参与请求生成一个 token；结果处理追加 token 后调用结束判断。完整 prefill 通常也会产生第一个 token，并进行结果处理。不会将一个 batch 的请求全部运行到 EOS 后才回到调度器。</li>
+  <li>请求结束会释放或转移资源，让新请求更容易准入，但不是重新调度的唯一触发条件。每轮循环都会接收请求并选择下一批；已有资源余量时，即使没有请求结束，也可接纳新请求。队列为空、<code class="language-plaintext highlighter-rouge">batch_is_full</code>、延迟策略等可能使该轮跳过新 prefill 构建，不能理解为每轮必定接纳或完整重排所有请求。</li>
+  <li>新请求一般先执行 prefill，之后才加入 decode 的活动集合；是否与已有 decode 混合执行取决于配置。连续批处理不是固定槽位一空就直接填一个尚未 prefill 的 decode 请求。</li>
+  <li>长短 KV 导致同一批中 attention 的工作量差异，影响整批执行时间；普通路径并没有为每个请求提供独立的完整 forward 完成事件。</li>
+  <li>split-KV 是 attention 内部的计算任务拆分，不增加请求数或当前 query token 数。它可改善并行度和任务长短差异，但不能保证完全均衡，也不减少全量 attention 所需读取的逻辑 KV 范围。</li>
+</ol>
+
+<p>不含图 padding、TP 切分等额外因素的 dense 模型 decode 例子：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>三个请求 A/B/C，本轮各输入一个 token，KV 长度为 1K / 1K / 8K
+
+hidden states [3, H]
+    → QKV 投影：三个 token 的 Q/K/V
+    → 某个 attention head 内：
+          A：1 个 split
+          B：1 个 split
+          C：8 个 split（示例配置）
+      产生局部结果，分别归并为 A/B/C 各一个 head 输出
+    → 多 head 输出及输出投影：[3, H]
+    → FFN：[3, H] → [3, I] → [3, H]（示意，门控结构省略）
+</code></pre></div></div>
+
+<p>这里 H 为 hidden size，I 为 FFN intermediate size。attention 内虽然示意为每个 head 共 10 个子任务，FFN 仍然只处理三个新 token，不会扩成十个 token 再让七个“空位”闲置。设备执行资源不会固定绑定某请求的 split 并保留到所有后续层；后续算子按自身形状安排任务。FFN 在小 batch 下仍可能利用率不足，但那属于 FFN 自己的计算形状与 kernel 问题，不能归因为上个 attention 的 split 留下空位。</p>
+
+<p>本节讨论普通非投机生成。投机解码一次可能提交多个 token，overlap 也会使提交与结果处理跨轮交错；它们仍须保留各自真实结束检查和依赖，后续专题展开。</p>
+
+<h3 id="event_loop_normal-一次循环到底生成几个-token"><code class="language-plaintext highlighter-rouge">event_loop_normal()</code> 一次循环到底生成几个 token</h3>
+
+<p>对普通非投机 decode，一次循环选择一个执行 batch，调用一次 <code class="language-plaintext highlighter-rouge">run_batch()</code>，通常为其中每个参与请求生成一个新 token，再调用 <code class="language-plaintext highlighter-rouge">process_batch_result()</code> 更新状态和检查结束。该次循环不会继续调用 forward 直到某个请求出现 EOS；即使所有请求都未结束，也会进入下一次循环重新进行接收与调度。</p>
+
+<p>示例：本轮 batch 为 <code class="language-plaintext highlighter-rouge">[A, B]</code>，执行后得到 <code class="language-plaintext highlighter-rouge">[a1, b1]</code>。若两者均未结束，下一轮可能继续 <code class="language-plaintext highlighter-rouge">[A, B]</code> 得到 <code class="language-plaintext highlighter-rouge">[a2, b2]</code>，也可能因新 prefill 或其他调度条件选择不同的工作。若 b2 是 EOS，结果处理将 B 标记结束，之后的 batch 过滤会将其移出；A 可以继续。</p>
+
+<p>这里的“每个请求”只指本轮实际执行 batch 中的普通 decode 请求，不包括等待队列或未被选中执行的活动请求。完整 prefill 通常产生第一个输出 token；chunked prefill 的中间块可能不提交生成 token；投机解码一次可能提交多个 token；空闲轮没有输出。因此不能把“一轮每请求一个 token”扩展为所有配置、所有 forward mode 的统一规则。</p>
+
+<h2 id="9-源码入口与后续问题">9. 源码入口与后续问题</h2>
+
+<p>源码路径相对 <code class="language-plaintext highlighter-rouge">python/sglang/srt/</code>：</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">managers/scheduler.py</code>：上述循环、选择、执行和结果分派。</li>
+  <li><code class="language-plaintext highlighter-rouge">managers/schedule_batch.py</code>：<code class="language-plaintext highlighter-rouge">Req</code>、<code class="language-plaintext highlighter-rouge">ScheduleBatch</code>、<code class="language-plaintext highlighter-rouge">prepare_for_extend()</code>、<code class="language-plaintext highlighter-rouge">prepare_for_decode()</code>、<code class="language-plaintext highlighter-rouge">update_finish_state()</code>。</li>
+  <li><code class="language-plaintext highlighter-rouge">managers/schedule_policy.py</code>：<code class="language-plaintext highlighter-rouge">PrefillAdder</code>，后续深入预算和准入条件。</li>
+  <li><code class="language-plaintext highlighter-rouge">managers/scheduler_components/batch_result_processor.py</code>：prefill/decode 输出提交与资源处理。</li>
+  <li><code class="language-plaintext highlighter-rouge">managers/tp_worker.py</code>：<code class="language-plaintext highlighter-rouge">forward_batch_generation()</code>，阶段 2 展开接口。</li>
+  <li><code class="language-plaintext highlighter-rouge">models/qwen2.py</code>、<code class="language-plaintext highlighter-rouge">layers/radix_attention.py</code>、<code class="language-plaintext highlighter-rouge">layers/logits_processor.py</code>：本讲模型计算的源码对应，阶段 3 深入。</li>
+</ul>
+
+<p>第一阶段待继续：用具体 token/KV 预算推演准入限制；内存不足时的 decode 回退；区分正常结束、取消和超时。阶段 2 再深入 ForwardBatch 字段契约。</p>
+
+
+      <footer class="site-footer">
+        
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a>.</span>
+      </footer>
+    </main>
+  </body>
+</html>

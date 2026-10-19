@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+
+<!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>FFN 并行度与常见优化 | lukeayin’s blog</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="FFN 并行度与常见优化" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="description" content="Qwen2 矩阵形状、TP 分片、融合、量化与 batch token 维度" />
+<meta name="twitter:description" property="og:description" content="Qwen2 矩阵形状、TP 分片、融合、量化与 batch token 维度" />
+<meta property="og:site_name" content="lukeayin’s blog" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="FFN 并行度与常见优化" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"Qwen2 矩阵形状、TP 分片、融合、量化与 batch token 维度","headline":"FFN 并行度与常见优化","url":"/sglang/architecture/ffn-parallelism.html"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link rel="preload" href="https://fonts.googleapis.com/css?family=Open+Sans:400,700&display=swap" as="style" type="text/css" crossorigin>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#157878">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <a id="skip-to-content" href="#content">Skip to the content.</a>
+
+    <header class="page-header" role="banner">
+      <h1 class="project-name">FFN 并行度与常见优化</h1>
+      <h2 class="project-tagline">Qwen2 矩阵形状、TP 分片、融合、量化与 batch token 维度</h2>
+      
+      
+    </header>
+
+    <main id="content" class="main-content" role="main">
+      <h1 id="ffn-并行度与常见优化">FFN 并行度与常见优化</h1>
+
+<p>状态：源码阅读专题；未运行性能实验。
+基线：<code class="language-plaintext highlighter-rouge">0957288be0818686034f33a3a7441434e4f5ba33</code>，2026-10-19。
+源码入口：<code class="language-plaintext highlighter-rouge">srt/models/qwen2.py</code>、<code class="language-plaintext highlighter-rouge">srt/layers/linear.py</code>、<code class="language-plaintext highlighter-rouge">srt/layers/dual_gemm.py</code>。</p>
+
+<h2 id="1-先看-ffn-的矩阵形状">1. 先看 FFN 的矩阵形状</h2>
+
+<p>Qwen2 使用 SwiGLU 风格 MLP。令当前 token 数为 M、hidden size 为 H、intermediate size 为 I：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>输入 X：[M, H]
+gate/up 投影：[M, H] × W_gate_up[H, 2I] → [M, 2I]
+SiluAndMul：[M, 2I] → [M, I]
+down 投影：[M, I] × W_down[I, H] → [M, H]
+</code></pre></div></div>
+
+<p>权重可能以转置布局存储；这里是数学 shape。普通单 token decode 的单请求 M=1，小 batch 时 M 较小。小 M 可能使矩阵 tile 的行方向利用率低，但不意味着只有 M 个设备任务。</p>
+
+<p>矩阵乘实现通常沿 M 和 N 两个输出轴分 tile。概念网格为：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>任务数 ≈ ceil(M / tile_M) × ceil(N / tile_N)
+</code></pre></div></div>
+
+<p>因此 M 很小时，gate/up 的宽输出维 <code class="language-plaintext highlighter-rouge">2I</code> 仍可能提供多个 N 向 tile。真实 kernel 的 tile 参数、融合方式和硬件映射需看实际后端；上述式子用于理解任务空间，不用于直接预测耗时。</p>
+
+<h2 id="2-sglang-qwen2-当前的张量并行切分">2. SGLang Qwen2 当前的张量并行切分</h2>
+
+<p><code class="language-plaintext highlighter-rouge">Qwen2MLP</code> 使用 <code class="language-plaintext highlighter-rouge">MergedColumnParallelLinear</code> 做 gate/up 投影，使用 <code class="language-plaintext highlighter-rouge">RowParallelLinear</code> 做 down 投影。概念上 TP=P 时：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>每个 rank 的 gate/up 权重列分片：W_gate_up[:, 2I/P]
+每个 rank 计算：X[M,H] × W_r[H,2I/P] → [M,2I/P]
+每 rank 在本地完成对应 gate/up 分片和激活
+
+down 权重按输入维切分：W_down[I/P,H]
+每 rank 的局部输入：[M,I/P]
+局部 down 输出：[M,H]
+通常需要跨 TP ranks reduce 局部输出，得到完整结果
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">ColumnParallelLinear</code> 的代码注释说明沿权重输出维分片；<code class="language-plaintext highlighter-rouge">RowParallelLinear</code> 沿权重输入维切分，输出可能需要归约。特定模型可设置延迟归约或融合通信，以上是 Qwen2 常见契约，不代表所有 MLP 都在每层以同样方式同步归约。</p>
+
+<p>TP 能把大权重与计算分到多个设备，也可能增加小 batch 下的通信和启动开销，并缩小每 rank 的局部矩阵。它是跨设备权重/计算切分，不是自动增加同一设备上的总算术工作量。</p>
+
+<h2 id="3-ffn-如何获得更多并行与降低执行时间">3. FFN 如何获得更多并行与降低执行时间</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>方法</th>
+      <th>主要改善</th>
+      <th>代价/限制</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>批内增加 token（更大 decode batch）</td>
+      <td>提高 M，更多独立行 tile，也可摊薄权重读取和启动成本</td>
+      <td>更多并发请求会受容量与延迟目标限制；调度由真实 Scheduler 决定</td>
+    </tr>
+    <tr>
+      <td>连续批处理</td>
+      <td>请求加入/结束后改变后续 decode batch 的 M</td>
+      <td>不是主动填满到某个目标，也不保证每请求等待相同</td>
+    </tr>
+    <tr>
+      <td>TP</td>
+      <td>沿 FFN 权重输出/输入维切分到多个设备</td>
+      <td>有通信、同步和每 rank 小矩阵成本；收益依模型、batch、链路而变</td>
+    </tr>
+    <tr>
+      <td>输出维/矩阵 tile 调度</td>
+      <td>将大 N 维划成多个 CTA/program，提高矩阵乘并行</td>
+      <td>依赖 kernel 的 tile、寄存器和共享存储配置；小 M 时每 tile 仍可能较小</td>
+    </tr>
+    <tr>
+      <td>融合 gate/up、激活和量化计算</td>
+      <td>减少 kernel launch、中间张量读写或重复转换</td>
+      <td>是否支持取决于 dtype、量化方式、GPU 架构、token 数、TP/spatial parallel 配置</td>
+    </tr>
+    <tr>
+      <td>量化权重/激活</td>
+      <td>减少带宽占用，可能使用更高吞吐的矩阵指令</td>
+      <td>可能改变精度、量化开销和 kernel 可用性；不是并行任务数量本身的增加</td>
+    </tr>
+    <tr>
+      <td>专家并行（MoE 模型）</td>
+      <td>将不同 token 路由到多个专家/设备</td>
+      <td>路由负载不均、token dispatch/通信成本；不是 dense FFN 的直接替代优化</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>若瓶颈在读取权重，量化、融合或摊薄 weight loads 往往比“再切更多 KV”相关；若瓶颈是 M 方向任务不足，提高 batch token 数可能有效；若矩阵 N 已提供很多 tile，单纯沿 reduction K 再切也可能多出 partial-sum 归并成本。必须用目标 kernel 和真实 profiling 判断瓶颈。</p>
+
+<p>Speculative decoding 等方法可能让一次 target forward 验证多个候选 token，提高 token 维度工作量，但引入 draft、verify、接受/拒绝逻辑，可能改变输出路径。它不属于可以无成本套上的 FFN 并行开关。</p>
+
+<h2 id="4-qwen2-的融合示例dualgemm">4. Qwen2 的融合示例：DualGemm</h2>
+
+<p><code class="language-plaintext highlighter-rouge">Qwen2MLP.forward()</code> 在条件满足时调用 <code class="language-plaintext highlighter-rouge">DualGemm</code>，否则走 <code class="language-plaintext highlighter-rouge">gate_up_proj → SiluAndMul → down_proj</code> 常规路径。</p>
+
+<p>当前 <code class="language-plaintext highlighter-rouge">DualGemm</code>（<code class="language-plaintext highlighter-rouge">python/sglang/srt/layers/dual_gemm.py</code>）实现检查 CUDA、dtype/量化方式、本地 intermediate 宽度和 decode token 数等条件；是否支持不只由 batch size 决定。可用路径将 gate/up 投影与 SwiGLU 相关计算融合，FP8 分支还可融合 quantization 处理，减少中间结果往返。</p>
+
+<p>这是减少 launch/中间带宽成本的例子，不会复用 Attention 的 KV split，也不会让 FFN 输出多出 KV split 数量的行。DualGemm 仍需按自身 GEMM 形状和硬件 tile 组织并行。</p>
+
+<h2 id="5-对性能仿真的含义">5. 对性能仿真的含义</h2>
+
+<ul>
+  <li>attention 与 FFN 分开建模，输入特征分别使用 per-request KV 长度和矩阵 M/N/K、dtype、量化、TP、后端等。</li>
+  <li>每个算子返回自身批量执行耗时；按真实 forward 的依赖关系组合。Attention 的 split 配置只属于 attention 代价，不能作为 FFN 的 task 数。</li>
+  <li>一个 <code class="language-plaintext highlighter-rouge">[M,H]</code> 输入对应 FFN 当前 token 数 M；融合可以改变操作边界和内存/launch 开销，不改变其语义 shape。</li>
+  <li>打桩阶段可用按 M、N、dtype/量化、TP 桶化的规则表达形状敏感性，但标注为合成参数。没有 profiler 或 NPU benchmark 时，不能声称已找出瓶颈或确定真实算子利用率。</li>
+  <li>目标后端启用融合、图执行、TP 或 MoE 时，仿真需要对应的整体代价/依赖数据；不能用当前 Qwen2 单卡解释覆盖所有模型。</li>
+</ul>
+
+<p>关联：<a href="/sglang/features/01-requests-and-scheduling.html">Qwen2 请求与 decode 例子</a>、<a href="/sglang/architecture/kv-split-planner-walkthrough.html">KV split planner</a>。</p>
+
+
+      <footer class="site-footer">
+        
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a>.</span>
+      </footer>
+    </main>
+  </body>
+</html>
