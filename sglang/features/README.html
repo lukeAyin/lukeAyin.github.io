@@ -47,7 +47,16 @@
     </header>
 
     <main id="content" class="main-content" role="main">
-      <h1 id="功能文档">功能文档</h1>
+      <div class="doc-layout">
+  <aside class="doc-toc" aria-label="文章目录">
+    <details open>
+      <summary>目录</summary>
+      <nav id="doc-toc-nav"></nav>
+      <a class="doc-toc-top" href="#">回到顶部</a>
+    </details>
+  </aside>
+  <div class="doc-body">
+    <h1 id="功能文档">功能文档</h1>
 
 <p>回答“这个功能负责什么、输入输出是什么、在什么条件下怎样运行”。学习后逐步创建正文，不预填尚未学习的结论。</p>
 
@@ -90,6 +99,225 @@
 </ol>
 
 <p>按内容复杂度合并小节，不为格式重复写相同内容。跨模块关系集中在架构文档，功能文档保留局部行为并引用它。</p>
+
+  </div>
+</div>
+
+<noscript>
+  <style>
+    .doc-toc { display: none; }
+    .doc-layout { display: block; }
+  </style>
+</noscript>
+
+<style>
+  .doc-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+    gap: 2rem;
+    align-items: start;
+  }
+
+  .doc-body {
+    min-width: 0;
+  }
+
+  .doc-toc {
+    position: sticky;
+    top: 1.5rem;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+    padding-right: 1rem;
+    border-right: 1px solid #e1e4e8;
+    font-size: 0.85rem;
+    line-height: 1.45;
+  }
+
+  .doc-toc details {
+    margin: 0;
+  }
+
+  .doc-toc summary {
+    cursor: pointer;
+    list-style: none;
+    font-weight: 600;
+    color: #159957;
+    margin-bottom: 0.75rem;
+  }
+
+  .doc-toc summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .doc-toc summary::before {
+    content: "▾ ";
+  }
+
+  .doc-toc details:not([open]) summary::before {
+    content: "▸ ";
+  }
+
+  .doc-toc nav ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .doc-toc nav li {
+    margin: 0.3rem 0;
+  }
+
+  .doc-toc nav a {
+    display: block;
+    color: #606c71;
+    text-decoration: none;
+    padding-left: 0.55rem;
+    border-left: 2px solid transparent;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .doc-toc nav a:hover,
+  .doc-toc nav a.active {
+    color: #159957;
+    border-left-color: #159957;
+  }
+
+  .doc-toc nav .toc-h3 a {
+    padding-left: 1.25rem;
+  }
+
+  .doc-toc nav .toc-h4 a {
+    padding-left: 1.95rem;
+    font-size: 0.8rem;
+  }
+
+  .doc-toc-top {
+    display: inline-block;
+    margin-top: 0.9rem;
+    color: #606c71;
+    font-size: 0.8rem;
+    text-decoration: none;
+  }
+
+  .doc-toc-top:hover {
+    color: #159957;
+  }
+
+  .doc-body h2,
+  .doc-body h3,
+  .doc-body h4 {
+    scroll-margin-top: 1.25rem;
+  }
+
+  .doc-body pre {
+    overflow-x: auto;
+  }
+
+  @media (max-width: 900px) {
+    .doc-layout {
+      display: block;
+    }
+
+    .doc-toc {
+      position: static;
+      max-height: none;
+      overflow: visible;
+      margin-bottom: 1.5rem;
+      padding: 0 0 1rem;
+      border-right: 0;
+      border-bottom: 1px solid #e1e4e8;
+    }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    html {
+      scroll-behavior: smooth;
+    }
+  }
+</style>
+
+<script>
+  (function () {
+    function buildToc() {
+      var body = document.querySelector(".doc-body");
+      var aside = document.querySelector(".doc-toc");
+      var nav = document.getElementById("doc-toc-nav");
+      if (!body || !aside || !nav) {
+        return;
+      }
+
+      var headings = Array.prototype.slice.call(
+        body.querySelectorAll("h2, h3, h4")
+      );
+      if (headings.length === 0) {
+        aside.hidden = true;
+        return;
+      }
+
+      var list = document.createElement("ul");
+      var items = [];
+
+      headings.forEach(function (heading, index) {
+        if (!heading.id) {
+          heading.id = "section-" + (index + 1);
+        }
+
+        var item = document.createElement("li");
+        item.className = "toc-" + heading.tagName.toLowerCase();
+
+        var link = document.createElement("a");
+        link.href = "#" + heading.id;
+        link.textContent = (heading.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        item.appendChild(link);
+        list.appendChild(item);
+        items.push({ heading: heading, link: link });
+      });
+
+      nav.appendChild(list);
+
+      var ticking = false;
+      function updateActive() {
+        var current = items[0];
+        items.forEach(function (item) {
+          if (item.heading.getBoundingClientRect().top <= 96) {
+            current = item;
+          }
+        });
+
+        items.forEach(function (item) {
+          var isCurrent = item === current;
+          item.link.classList.toggle("active", isCurrent);
+          if (isCurrent) {
+            item.link.setAttribute("aria-current", "location");
+          } else {
+            item.link.removeAttribute("aria-current");
+          }
+        });
+
+        ticking = false;
+      }
+
+      function onScroll() {
+        if (!ticking) {
+          window.requestAnimationFrame(updateActive);
+          ticking = true;
+        }
+      }
+
+      window.addEventListener("scroll", onScroll, { passive: true });
+      updateActive();
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", buildToc);
+    } else {
+      buildToc();
+    }
+  })();
+</script>
 
 
       <footer class="site-footer">
