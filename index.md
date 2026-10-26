@@ -11,3 +11,4 @@ description: 记录代码、系统与 AI 工程的实践笔记
 ## 系列
 
 - [SGLang 博客系列](sglang/)：无 NPU 性能预测的源码学习与架构笔记
+- [vLLM 源码笔记](vllm/)：vLLM 推理框架的架构与源码学习笔记

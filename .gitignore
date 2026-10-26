@@ -4,6 +4,11 @@
 
 # Jekyll build artifacts
 _site/
+.build-src/
 .jekyll-cache/
 .jekyll-metadata
 .sass-cache/
+
+# Local source archives
+VLLM.zip
+/VLLM.md
