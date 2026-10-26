@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: 文章标题
 description: 一句话说明这篇文章讲什么
 series_article: true

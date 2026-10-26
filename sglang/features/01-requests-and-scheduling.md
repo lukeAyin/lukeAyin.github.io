@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "请求、batch 与调度主循环"
 description: "Qwen2 prefill/decode、请求与 batch、KV 位置和调度主循环"
 ---

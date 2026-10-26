@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "vLLM 源码笔记"
 description: "vLLM 推理框架架构与源码学习笔记"
 ---

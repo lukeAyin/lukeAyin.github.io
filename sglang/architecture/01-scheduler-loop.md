@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "调度循环与模型执行"
 description: "Scheduler、Worker 与模型执行的数据流和跨轮状态"
 ---

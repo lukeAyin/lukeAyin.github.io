@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "get_num_kv_splits 逐步解读与 FFN 并行边界"
 description: "get_num_kv_splits 的三个分支、动态启发式与实际 split 范围"
 ---

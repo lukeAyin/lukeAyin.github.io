@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "排队策略的选择、适用场景与降级"
 description: "八类排队策略的排序依据、适用场景与降级"
 ---

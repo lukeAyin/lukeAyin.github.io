@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: SGLang 博客系列
 description: 无 NPU 性能预测的源码学习与架构笔记
 ---

@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "无 NPU 性能预测：学习路线与进度"
 description: "七阶段学习顺序、源码入口与完成标准"
 ---

@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "KV 分块、算子并行与 batch 流水"
 description: "分页、tile、split-KV、chunked prefill、overlap 与 PP 的边界"
 ---

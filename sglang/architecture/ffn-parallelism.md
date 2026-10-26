@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "FFN 并行度与常见优化"
 description: "Qwen2 矩阵形状、TP 分片、融合、量化与 batch token 维度"
 ---

@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "功能文档"
 description: "功能职责、输入输出、行为与具体例子"
 ---

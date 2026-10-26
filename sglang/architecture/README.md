@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "架构文档"
 description: "模块关系、调用链、数据流与仿真边界"
 ---

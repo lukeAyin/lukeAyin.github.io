@@ -1,5 +1,5 @@
 ---
-layout: default
+layout: toc
 title: "SGLang 学习与架构笔记"
 description: "文档入口、已确认约束与学习记录方式"
 ---

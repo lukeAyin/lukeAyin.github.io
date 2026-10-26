@@ -22,9 +22,9 @@ defaults:
   - scope:
       path: "sglang"
     values:
-      layout: default
+      layout: toc
       order: 99
   - scope:
       path: "vllm"
     values:
-      layout: default
+      layout: toc
