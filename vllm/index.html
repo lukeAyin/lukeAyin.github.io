@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+
+<!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>vLLM 源码笔记 | lukeayin’s blog</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="vLLM 源码笔记" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="description" content="vLLM 推理框架架构与源码学习笔记" />
+<meta name="twitter:description" property="og:description" content="vLLM 推理框架架构与源码学习笔记" />
+<meta property="og:site_name" content="lukeayin’s blog" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="vLLM 源码笔记" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"vLLM 推理框架架构与源码学习笔记","headline":"vLLM 源码笔记","url":"/vllm/"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link rel="preload" href="https://fonts.googleapis.com/css?family=Open+Sans:400,700&display=swap" as="style" type="text/css" crossorigin>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#157878">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <a id="skip-to-content" href="#content">Skip to the content.</a>
+
+    <header class="page-header" role="banner">
+      <h1 class="project-name">vLLM 源码笔记</h1>
+      <h2 class="project-tagline">vLLM 推理框架架构与源码学习笔记</h2>
+      
+      
+    </header>
+
+    <main id="content" class="main-content" role="main">
+      <h1 id="vllm">VLLM</h1>
+
+<h2 id="introduce">Introduce</h2>
+
+<p>Q：推理框架是什么？</p>
+
+<p>换个问法，推理框架解决了什么问题？-&gt; 部署一个LLM模型用来推理！</p>
+
+<blockquote>
+  <p>把大象放进冰箱里</p>
+
+</blockquote>
+
+<p>部署一个大型LLM模型来提供推理服务会遇到什么问题？</p>
+
+<ol>
+  <li>
+    <p>Load_Model</p>
+
+    <ol>
+      <li>
+        <p>Sharding Model</p>
+      </li>
+      <li>
+        <p>Quantization</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>Get_Prompt</p>
+
+    <ol>
+      <li>
+        <p>API_Server</p>
+      </li>
+      <li>
+        <p>Schedule</p>
+      </li>
+      <li>
+        <p>Continuous batching</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>Forward</p>
+
+    <ol>
+      <li>
+        <p>KV cache</p>
+      </li>
+      <li>
+        <p>Paralle</p>
+      </li>
+      <li>
+        <p>Specdec</p>
+      </li>
+      <li>
+        <p>Scale up</p>
+      </li>
+      <li>
+        <p>Kernel compile</p>
+      </li>
+    </ol>
+  </li>
+</ol>
+
+<blockquote>
+  <p>山僧不识英雄汉，只恁晓晓问姓名</p>
+
+</blockquote>
+
+<h2 id="architecture">Architecture</h2>
+
+<blockquote>
+  <p>暂定</p>
+
+</blockquote>
+
+<p><img src="/vllm/assets/img_v3_0216q_8296a0a4-db85-495a-b1d5-5d3bffd3ff7g.jpg" alt="img_v3_0216q_8296a0a4-db85-495a-b1d5-5d3bffd3ff7g.jpg" /></p>
+
+<h2 id="kv-cache-manager">KV Cache Manager</h2>
+
+<p>存储依靠三元组BlockHash{parent hash value, block tokens, extra hashes}</p>
+
+<p>Parent hash value: 上一个chunk的BlockHash三元组的hash</p>
+
+<p>Extra hashes</p>
+
+<ol>
+  <li>
+    <p>Lora ID/多模态-&gt; token一致但是对应的kv值不一致</p>
+  </li>
+  <li>
+    <p>Cache salt-&gt;kv值一致，但是希望kv不共享-&gt;不同用户/组织-&gt;保护隐私-&gt;避免从TTFT推测是否被问过这个问题-&gt;研究进度/股票(只放在第一个chunk上)</p>
+  </li>
+</ol>
+
+<pre><code class="language-Python">class KVCacheBlock:
+    # The block ID (immutable)
+    block_id: int
+    # The block hash (will be assigned when the block is full,
+    # and will be reset when the block is evicted).
+    block_hash: BlockHash
+    # The number of requests using this block now.
+    ref_cnt: int
+
+    # The pointers to form a doubly linked list for the free queue.
+    prev_free_block: "KVCacheBlock | None" = None
+    next_free_block: "KVCacheBlock | None" = None
+</code></pre>
+
+<p><img src="/vllm/assets/image%203.png" alt="image.png" /></p>
+
+<p>请求出现duplicated block：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>已有缓存
+Block Table: [0 (ABCD), 1 (EFGH)]
+Cache Blocks: 0, 1
+新来请求：
+Prompt: [A, B, C, D, E, F]
+Output: [G, H, I]
+
+Time 0:
+  Tokens: [A, B, C, D, E, F, G]
+  Block Table: [0 (ABCD), 3 (EFG)]
+  Cache Blocks: 0, 1
+Time 1:
+  Tokens: [A, B, C, D, E, F, G, H]
+  Block Table: [0 (ABCD), 3 (EFGH)]
+  Cache Blocks: 0, 1, 3
+</code></pre></div></div>
+
+<p>v1实现：延迟到请求结束（ref=0）释放</p>
+
+<p>v0实现：监测到重复立即释放</p>
+
+<p>free（ref==0）：反方向的将KVCacheBlock添加到free queue中，因为parent先释放，后续的都不能用。释放是先释放队列前边的。</p>
+
+<p>eviction：从free queu队头弹出（LRU）</p>
+
+<h4 id="hybird-kv-cache">Hybird kv cache</h4>
+
+<p>Allocator代表管理kv cache的额外成本，hybird kv cache会需要多个allocator。因为Attn不同对应的kv page size不同（full vs swa）</p>
+
+<p><img src="/vllm/assets/image%206.png" alt="image.png" /></p>
+
+<p>几种场景：</p>
+
+<ol>
+  <li>
+    <p>每层对应一个block_size-&gt; allocator调用多次（layers数量个allocator-&gt;block ID不共用-&gt;一个ID只对应一层</p>
+  </li>
+  <li>
+    <p>假如full vs swa配比如(10 : 20) 1:2-&gt; 使用10层（最大公约数）作为一个group，分为三个group，分别是(group0:full0-9, group1:swa 0-9, group2:swa 10-19)</p>
+  </li>
+  <li>
+    <p>假如配比是（52:10），最大公约数为2，则group需要36个，代价和逐层一个allocator一样。解决方案为padding</p>
+  </li>
+</ol>
+
+<p>改为60:10，最大公约数为10. group变为7.</p>
+
+<ol>
+  <li>
+    <p>kv_hidden_size不同。？？？</p>
+  </li>
+  <li>
+    <p>Kv sharing。 共享的层不需要allocator。dsa4.1</p>
+  </li>
+</ol>
+
+<p>Prefix Cache</p>
+
+<ol>
+  <li>
+    <p>Full attn</p>
+
+    <ol>
+      <li>
+        <p>free when request over</p>
+      </li>
+      <li>
+        <p>Hit when chunk hash equal</p>
+      </li>
+      <li>
+        <p>From left to right</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>SWA</p>
+
+    <ol>
+      <li>
+        <p>Free when outside the sliding window</p>
+      </li>
+      <li>
+        <p>Hit when (sliding_window_size - 1) hit</p>
+      </li>
+      <li>
+        <p>From right to left(完全未命中时代价特别大)</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>SWA+Full</p>
+  </li>
+</ol>
+
+<p>SWA命中时，Full一定命中。因此SWA从full命中的长度开始从右向左找，避免了swa未命中时特别大的代价。</p>
+
+<h2 id="llmengine">LLMEngine</h2>
+
+<p>LLMEngine执行过程分为几部分</p>
+
+<h3 id="construct">Construct</h3>
+
+<ol>
+  <li>
+    <p>Init device-&gt; (cuda to worker\ dtype \ memory enough\ distributed setting\ instantiate model_runner)</p>
+  </li>
+  <li>
+    <p>Load model weight</p>
+  </li>
+  <li>
+    <p>Initialize KV Cache</p>
+
+    <ol>
+      <li>
+        <p>Allocator</p>
+      </li>
+      <li>
+        <p>Dummy forward</p>
+
+        <ol>
+          <li>
+            <p>compute KV block num \&amp; bind kv cache tensor to attn</p>
+          </li>
+          <li>
+            <p>Warm batch size (capture CUDA graph)</p>
+          </li>
+        </ol>
+      </li>
+    </ol>
+  </li>
+</ol>
+
+<h3 id="generate">Generate</h3>
+
+<h4 id="feed-request">Feed request</h4>
+
+<ol>
+  <li>
+    <p>Create request ID</p>
+  </li>
+  <li>
+    <p>Input processor(tokenizor)</p>
+  </li>
+  <li>
+    <p>EngineCoreRequest</p>
+  </li>
+  <li>
+    <p>Scheduler(waiting queue)</p>
+  </li>
+  <li>
+    <p>Continuous batching(inject request)</p>
+  </li>
+</ol>
+
+<h4 id="step-loop">Step (loop)</h4>
+
+<ol>
+  <li>
+    <p>Scheduler: select request to running queue</p>
+  </li>
+  <li>
+    <p>Forward pass: run model and sample output token</p>
+  </li>
+  <li>
+    <p>Postprocess: append sampled token IDs -&gt; detokenize -&gt; check stop condition -&gt; clean up -&gt; return output</p>
+  </li>
+</ol>
+
+<h5 id="scheduler">Scheduler</h5>
+
+<p><img src="/vllm/assets/image%201.png" alt="image.png" /></p>
+
+<h5 id="forward-pass">Forward pass</h5>
+
+<ol>
+  <li>
+    <p>更新请求batch kv cache block ID</p>
+  </li>
+  <li>
+    <p>准备输入（CPU-&gt;GPU）</p>
+  </li>
+  <li>
+    <p>Forward pass</p>
+
+    <ol>
+      <li>
+        <p>Eager</p>
+      </li>
+      <li>
+        <p>Graph mode（KV Initialize dummy call get cuda graph）</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>Last token sampling</p>
+  </li>
+</ol>
+
+<p><img src="/vllm/assets/ISdZXo8i.png" alt="ISdZXo8i.png" /></p>
+
+<p><strong>Figure 4</strong>: Forward pass: continuous batching and paged attention</p>
+
+<h3 id="advanced-feature">Advanced feature</h3>
+
+<h4 id="chunked-prefill">Chunked prefill</h4>
+
+<p>scheduler中将prefill和decode混合到一个batch依赖这个功能。</p>
+
+<p>关键变量：</p>
+
+<ol>
+  <li>
+    <p>max_num_batched_token 当前批次支持处理的token数量（profill ：N ，decode：1）</p>
+  </li>
+  <li>
+    <p>long_prefill_token_threshold</p>
+  </li>
+</ol>
+
+<p><img src="/vllm/assets/v4RbfgPI.png" alt="v4RbfgPI.png" /></p>
+
+<h4 id="prefix-caching">Prefix caching</h4>
+
+<p>在generate阶段处理。</p>
+
+<ol>
+  <li>
+    <p>split_chunks</p>
+  </li>
+  <li>
+    <p>find_longest_cache_hit-&gt;list[KVCacheBlock]</p>
+  </li>
+</ol>
+
+<h4 id="speculative-decoding">Speculative decoding</h4>
+
+<p>分三步draft-&gt;verify-&gt;accept/reject</p>
+
+<p>带来一个问题：一个decode会同时生产多个token，需要提前对KV block 占位。</p>
+
+<h4 id="pd-disaggregated">P/D disaggregated</h4>
+
+<p><img src="/vllm/assets/image%204.png" alt="image.png" /></p>
+
+<h3 id="scale-up">Scale Up</h3>
+
+<h4 id="tp">TP</h4>
+
+<p>Execute_model-&gt;</p>
+
+<ol>
+  <li>
+    <p>UniprocExecutor-&gt; execute_model()</p>
+  </li>
+  <li>
+    <p>MultiProcExecutor-&gt;rpc_broadcast_mq()</p>
+  </li>
+</ol>
+
+<p><img src="/vllm/assets/image%202.png" alt="image.png" /></p>
+
+<h4 id="pp">PP</h4>
+
+<blockquote>
+  <p>todo!</p>
+
+</blockquote>
+
+<h3 id="scaleout">ScaleOut</h3>
+
+<p>DP</p>
+
+<h2 id="torch-compile">Torch Compile</h2>
+
+<p>主要是编译过程中的优化,有下面特点</p>
+
+<ol>
+  <li>
+    <p>Config considered-&gt; sharding/operator不同的并行和算子编译结果不一样</p>
+  </li>
+  <li>
+    <p>Before serving-&gt; 需要在提供服务前就编译好（warm up）</p>
+
+    <ol>
+      <li>Without shape guard</li>
+    </ol>
+  </li>
+</ol>
+
+<pre><code class="language-Python">def f(x):
+    # x为(1,N)时，可以减少一步复制操作。
+    
+    return x.transpose(0,1).contiguous()
+</code></pre>
+
+<ol>
+  <li><strong>当 **</strong><code class="language-plaintext highlighter-rouge">N=1</code><strong>** 时，可以省掉复制</strong></li>
+</ol>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>x:
+[[a, b, c, d]]
+
+shape  = [1, 4]
+stride = [4, 1]
+</code></pre></div></div>
+
+<p>转置以后：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>x.T:
+[[a],
+ [b],
+ [c],
+ [d]]
+
+shape  = [4, 1]
+stride = [1, 4]
+</code></pre></div></div>
+
+<p>虽然 stride 看起来不是通常的 <code class="language-plaintext highlighter-rouge">[1, 1]</code>，但它仍然连续：<strong>长度为 1 的维度只有一个位置，其 stride 不影响实际遍历。</strong></p>
+
+<p>按逻辑顺序读取，仍然是：</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>a → b → c → d
+</code></pre></div></div>
+
+<p>此时就有三种编译模式</p>
+
+<ol>
+  <li>
+    <p>BACKED：N=1 特化</p>
+  </li>
+  <li>
+    <p>UNBACKED: 完全不特化，退化为所有都复制</p>
+  </li>
+  <li>
+    <p>BACKED_SIZE_OBLIVIOUS: size=0\1的特化取消，其他shape的特化保留</p>
+  </li>
+</ol>
+
+<p>Attn分为</p>
+
+<ol>
+  <li>
+    <p>Eager</p>
+  </li>
+  <li>
+    <p>CudaGraph_compatible</p>
+
+    <ol>
+      <li>
+        <p>ALL:FlashAttn3</p>
+      </li>
+      <li>
+        <p>Decode Only:FlashInfer\FlashMLA\Mamba</p>
+      </li>
+    </ol>
+
+    <blockquote>
+      <p>decode只处理一个query，多样性更小。prefill的query数量也会变好，图难以固定）</p>
+
+      <p>Prefill :batchA[128,128] batchB[255,1]</p>
+
+      <p>Decode: batchC[1,1,1,1]</p>
+
+    </blockquote>
+  </li>
+</ol>
+
+<p><img src="/vllm/assets/image.png" alt="image.png" /></p>
+
+<p><img src="/vllm/assets/image%205.png" alt="image.png" /></p>
+
+<p>Attn针对cudagraph_compatible分为四个level</p>
+
+<ol>
+  <li>
+    <p>always</p>
+  </li>
+  <li>
+    <p>unifom_batch</p>
+  </li>
+  <li>
+    <p>uniform_single_token_decode</p>
+  </li>
+  <li>
+    <p>never</p>
+  </li>
+</ol>
+
+<blockquote>
+  <p>Torch compile比较好回答了为什么仿真需要抓图/为什么需要runtime仿真</p>
+
+</blockquote>
+
+<h2 id="参考文献">参考文献</h2>
+
+<p><a href="https://vllm.ai/blog/2025-09-05-anatomy-of-vllm#generate-function">https://vllm.ai/blog/2025-09-05-anatomy-of-vllm#generate-function</a></p>
+
+<p><a href="https://github.com/vllm-project/vllm/tree/main/docs/design">https://github.com/vllm-project/vllm/tree/main/docs/design</a></p>
+
+
+
+      <footer class="site-footer">
+        
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a>.</span>
+      </footer>
+    </main>
+  </body>
+</html>
