@@ -326,6 +326,15 @@ down 权重按输入维切分：W_down[I/P,H]
         return;
       }
 
+      var details = aside.querySelector("details");
+      if (
+        details &&
+        window.matchMedia &&
+        window.matchMedia("(max-width: 900px)").matches
+      ) {
+        details.removeAttribute("open");
+      }
+
       var list = document.createElement("ul");
       var items = [];
 

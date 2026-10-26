@@ -661,6 +661,15 @@ hidden states [3, H]
         return;
       }
 
+      var details = aside.querySelector("details");
+      if (
+        details &&
+        window.matchMedia &&
+        window.matchMedia("(max-width: 900px)").matches
+      ) {
+        details.removeAttribute("open");
+      }
+
       var list = document.createElement("ul");
       var items = [];
 
