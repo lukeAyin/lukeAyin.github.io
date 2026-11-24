@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+
+<!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>SGLang 源码笔记 | lukeayin’s blog</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="SGLang 源码笔记" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="description" content="SGLang 前端、KV 复用、HiCache、投机推理与 Simulator 架构笔记" />
+<meta name="twitter:description" property="og:description" content="SGLang 前端、KV 复用、HiCache、投机推理与 Simulator 架构笔记" />
+<meta property="og:site_name" content="lukeayin’s blog" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2026-11-24T00:00:00+00:00" />
+<meta property="article:modified_time" content="2026-11-24T00:00:00+00:00" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="SGLang 源码笔记" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BlogPosting","dateModified":"2026-11-24T00:00:00+00:00","datePublished":"2026-11-24T00:00:00+00:00","description":"SGLang 前端、KV 复用、HiCache、投机推理与 Simulator 架构笔记","headline":"SGLang 源码笔记","mainEntityOfPage":{"@type":"WebPage","@id":"/sglang/SGLANG.html"},"url":"/sglang/SGLANG.html"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link rel="preload" href="https://fonts.googleapis.com/css?family=Open+Sans:400,700&display=swap" as="style" type="text/css" crossorigin>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#157878">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <a id="skip-to-content" href="#content">Skip to the content.</a>
+
+    <header class="page-header" role="banner">
+      <h1 class="project-name">SGLang 源码笔记</h1>
+      <h2 class="project-tagline">SGLang 前端、KV 复用、HiCache、投机推理与 Simulator 架构笔记</h2>
+      
+      
+    </header>
+
+    <main id="content" class="main-content" role="main">
+      <div class="doc-layout">
+  <aside class="doc-toc" aria-label="文章目录">
+    <details open>
+      <summary>目录</summary>
+      <nav id="doc-toc-nav"></nav>
+      <a class="doc-toc-top" href="#">回到顶部</a>
+    </details>
+  </aside>
+  <div class="doc-body">
+    <h1 id="sglang">SGLANG</h1>
+
+<p>sglang=structured generation language</p>
+
+<p>LM program指的是在程序调度和控制LLM的生成。（各种agent）</p>
+
+<p>LM program有两个特点：1. 通常在控制流中需要多次调用LLM 2. 输入和输出一般是结构化的。</p>
+
+<p>LM program面临两个困难：1. LLM模型的不确定性，不确定性导致需要做很多额外的工作，如： 2. 重复计算和存储占用。</p>
+
+<p>SGLang就主要围绕这两个困难展开。</p>
+
+<p>编译结果为SGLang IR（计算图的形式，走Graph Executor来执行），</p>
+
+<p><img src="/sglang/assets/image%208.png" alt="image.png" /></p>
+
+<h2 id="前端">前端</h2>
+
+<h3 id="sglang原语">SGLang原语</h3>
+
+<p><img src="/sglang/assets/image%207.png" alt="image.png" /></p>
+
+<p>红色的都是sglang的原语</p>
+
+<p><img src="/sglang/assets/image%202.png" alt="image.png" /></p>
+
+<p><img src="/sglang/assets/image%2015.png" alt="image.png" /></p>
+
+<p>前端对应的是LMQL/DSPy</p>
+
+<p>（目前前端已被官方标记为deprecated，不再演进，未来的演进方向是和vllm一致的HTTP API方式）</p>
+
+<p>当前的使用方式：</p>
+
+<pre><code class="language-Python">from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import wait_for_server, print_highlight, terminate_process
+
+server_process, port = launch_server_cmd(
+    "python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --log-level warning"
+)
+
+wait_for_server(f"http://localhost:{port}")
+print(f"Server started on http://localhost:{port}")
+</code></pre>
+
+<h2 id="后端">后端</h2>
+
+<h3 id="kv复用">KV复用</h3>
+
+<h4 id="radix-tree">Radix tree</h4>
+
+<p>Radix tree是压缩前缀树，和prefix tree(前缀树，又称字典树)的主要区别就在于radix tree的一个节点不止可以存储单个点，还可以存储一段连续的序列。</p>
+
+<p><img src="/sglang/assets/image%2012.png" alt="image.png" /></p>
+
+<blockquote>
+  <p>树节点可以是单token粒度（page_size=1）也可以配置page_size（为了提升flashAttn速度）</p>
+
+</blockquote>
+
+<blockquote>
+  <p>fork原语的特殊优化：先发送prefix，确保KV插树，再发送剩余prompt。</p>
+
+</blockquote>
+
+<p>同样可以将用户的cache_salt作为不同用户之间的请求隔离，在树的根节点分叉出不同的分支。</p>
+
+<h4 id="cache-aware-scheduling">Cache-aware scheduling</h4>
+
+<p>为了避免不相关对话交替调度导致prefix命中率下降，编排batch时会根据prefix命中长度来给请求排序（longest-prefix-match），优先处理长度长的请求-&gt;对应dfs算法。</p>
+
+<p>缺点：会导致一些请求饿死</p>
+
+<p>改进方法：</p>
+
+<ol>
+  <li>
+    <p>老化：给请求记录超时时间，超时执行。</p>
+  </li>
+  <li>
+    <p>dfs-weight算法：不只看前缀匹配长度，还会看前缀子树下积压的请求数和等待时间。如果冷门子树下积压的请求数多、等待时间长，就会执行。</p>
+  </li>
+  <li>
+    <p>windowed-LPM：只对固定窗口下的请求做LPM排序，不会让请求不限制的塞入队列头。</p>
+  </li>
+  <li>
+    <p>chunked-prefill：引入chunked_prefill_size，命中长度低的请求的prefill阶段计算多，限制一个冷门长请求计算显存不足or占据GPU时间过长。</p>
+  </li>
+</ol>
+
+<h4 id="kv语义匹配">KV语义匹配</h4>
+
+<ol>
+  <li>
+    <p>Position-Independent Caching/CacheBlend机制</p>
+
+    <p>非前缀kv复用</p>
+
+    <ol>
+      <li>计算特征/语义相似度-&gt;prefix可以非连续</li>
+    </ol>
+
+    <p>sglang使用CacheBlend，会直接把kv管理的后端替换为LMCache，后端的kvcache组织方式不再是radix tree，而是chunk hash的方式。而vllm使用，则会将kv管理分为两步，请求先使用vllm自己PagedAttention Block Hash（L1）来查找前缀命中，当前缀出现截断了，把后续未命中序列分块之后交由LMCacheConnectorV1（L2）。</p>
+
+    <ol>
+      <li>
+        <p>采用特殊分隔符进行切分-&gt;不同的文本块（段落/文档）</p>
+      </li>
+      <li>
+        <p>重置哈希起点。</p>
+      </li>
+      <li>
+        <p>块内token需要严格保持一致。</p>
+      </li>
+      <li>
+        <p>位置编码修正与局部重算-&gt;复用KV，修正Key的RoPE进行修正。</p>
+      </li>
+      <li>
+        <p>复用块之间的token局部重算，极少数受影响最大（只跑第一层，获取第一层KV，对比KV的向量偏移，排序）进行token重算(10%-15%)</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>SemBlend：</p>
+
+    <p>真正的语义匹配</p>
+  </li>
+</ol>
+
+<p><img src="/sglang/assets/image%2013.png" alt="image.png" /></p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>核心donor search：
+
+1. Chunk fast path（chunk粒度）
+
+将请求切分为chunk，按照chunk和当前保存的倒排donor\(chunk为key， donor为value）做精确hash对比。
+
+2. embedding search（request粒度）
+
+    1. 对整个请求的embedding做余弦值对比，相似度最高的topk，相似度最低是0\.6
+
+    2. 如果topk不足5个时，按照chunk粒度找到chunk匹配最多的donor来补充到topk
+
+    3. 之后将topk donor和请求计算Jaccard，过滤低于0\.5的donor。
+</code></pre></div></div>
+
+<p><img src="/sglang/assets/image%201.png" alt="image.png" /></p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>    4. 对过滤后的donor计算reuse ratio。这个方法为滑窗计算hash（默认16），根据hash判读当前请求的token窗口是否在donor中有命中。最后根据cosine x reuse ratio来排序，对排名最高的三个donor进行边界对齐。
+
+    5. 边界对齐方法：
+
+        1. 滑窗计算hash（默认64），根据hash精确匹配, 最多选择8个segment。超过50%即按照当前方法作为最终结论否则继续执行。
+
+        2. 对chunk（默认256）进行模糊匹配，根据两个chunk之间的token重叠率筛选，筛选之后计算置信度，置信度满足0\.95保存。
+
+        3. 计算chunk hash（256）的精确匹配，过滤孤立chunk。
+</code></pre></div></div>
+
+<ol>
+  <li>网关层语义缓存（Semantic Cache）+Sglang路由。（架构上从网关层做语义匹配，模型层只做精确生成）</li>
+</ol>
+
+<p>路由层根据语义进行路由，满足阈值可以直接返回缓存结果。</p>
+
+<h4 id="线性注意力kv">线性注意力KV</h4>
+
+<p>缓存处理完的一段prefix后的state(state checkpoint)。 当发生cache miss，从最近可用state重新计算。</p>
+
+<p>SGLang在处理线性注意力时，有两个行为level。</p>
+
+<ol>
+  <li>
+    <p>level2:在请求结束和prefix分叉的位置保存checkpoint</p>
+  </li>
+  <li>
+    <p>level3:在level2的基础上增加在prefill chunk和decode固定间隔创建checkpoint。</p>
+  </li>
+</ol>
+
+<p>混合注意力会导致不同层cache的命中率不一致，选择full和线性命中最小的cache长度开始重新计算。</p>
+
+<p>vllm：默认level3行为，可以通过设置Mamba Block Size来控制checkpoint 间隔。请求结束也会保存，prefix分叉位置目前作为可选功能，非默认。</p>
+
+<h4 id="radix-kv分布式部署">Radix KV分布式部署</h4>
+
+<ol>
+  <li>TP</li>
+</ol>
+
+<p>维护一棵全局共享的radix tree(主进程) // 和vllm中的allocator作用一致。</p>
+
+<p>不同的GPU存不同注意力头，因此所有GPU只需要存自己注意力头的KV，索引ID可以保持一致。主进程可以一次批量调度所有GPU，不需要分开处理。</p>
+
+<ol>
+  <li>
+    <p>DP</p>
+
+    <ol>
+      <li>
+        <p>各自独立维护 /不共享</p>
+      </li>
+      <li>
+        <p>通过SGLang Router来避免cache存在A，但是request却发给了B</p>
+      </li>
+    </ol>
+
+    <p>SGLangRouter-&gt;Cache-AwareRouter/Prefix-Aware Load Balancer</p>
+
+    <p>1). Router维护全局前缀树，value不存储KV地址，改为workerID。全局前缀树是近似GPU的radix tree，因为他默认只依赖输入prompt，不会去根据生成的token来更新树（这部分特性是可选的，后续也实现的有会根据GPU生成token来进行同步的，但是会引入同步消耗，适合多轮增量交互的场景，如agent)</p>
+
+    <p>2). 根据全局前缀树，选择前缀缓存最长的worker来路由（长前缀优先匹配）。如果该GPU排队过长，会选择空闲的GPU进行重建（负载感知）。</p>
+  </li>
+  <li>
+    <p>DP Attn for MLA</p>
+
+    <p>MLA保存的kv和head无关，只有一份。按照TP切分，需要把kvcache在不同的rank中都保存一份，严重浪费显存。</p>
+  </li>
+</ol>
+
+<p><img src="/sglang/assets/image%209.png" alt="image.png" /></p>
+
+<h3 id="jump-forward">Jump-Forward</h3>
+
+<h4 id="compressed-fsm">Compressed FSM</h4>
+
+<p>对于JSON这种结构化的输出，原始的decoding效率差。因为从语法规则上来说，有一些是确定性的输出，但是也需要一次完整的自回归，资源浪费。</p>
+
+<p>举例：</p>
+
+<p>对于输出{“summary”:”，总共五个字符。需要经过</p>
+
+<p><img src="/sglang/assets/image.png" alt="image.png" /></p>
+
+<p>使用Compressed FSM来加快decoding过程，上述的FSM多条边都只有一个分支，因此我们通过文法分析器CFSM来压缩多条边为一条边。</p>
+
+<p><img src="/sglang/assets/image%205.png" alt="image.png" /></p>
+
+<p>压缩的含义-&gt;多个token直接发给LLM(对这多个token做prefill)</p>
+
+<p>应用场景：</p>
+
+<ol>
+  <li>
+    <p>规范格式/跳过废话（我将用最直白，最不绕弯子...）</p>
+  </li>
+  <li>
+    <p>DSL零语法错误生成（JSON等语言）</p>
+  </li>
+  <li>
+    <p>强制拒答。（检测违规匹配，直接替换为固定拒答模板发给LLM）</p>
+  </li>
+  <li>
+    <p>在中转站让DeepSeek伪装Claude.  :-)</p>
+  </li>
+  <li>
+    <p>select原语（将选项拼到prompt后面，计算不同prefill的token的条件对数概率）。</p>
+  </li>
+</ol>
+
+<h4 id="xgrammar">XGrammar</h4>
+
+<blockquote>
+  <p>正则文法是上下文无关文法的一个子集。两者的区别在于能否允许出现嵌套。JSON其实是上下文无关文法{}。</p>
+
+  <p><img src="/sglang/assets/image%2010.png" alt="image.png" /></p>
+
+</blockquote>
+
+<p>上述的CFSM只能做正则语法的分析，对于上下文无关文法无能为力。</p>
+
+<p>XGrammar使用PDA(PushDown Automaton,下推自动机)来替换默认的FSM，并且使用c++开发，效率极高。</p>
+
+<p>PDA相比FSM主要多了一个栈，对应的状态转移也多了入栈、出栈操作，对应json中就是<strong>{“</strong> 入栈和<strong>}“</strong> 出栈。</p>
+
+<h4 id="jump-forward-vs-mtp">Jump-Forward vs MTP</h4>
+
+<p>在当前实际的SGLang使用中，一般不会使用上面介绍的jump-forward技术。</p>
+
+<p>主要原因为：</p>
+
+<ol>
+  <li>
+    <p>和投机推理冲突。</p>
+
+    <ol>
+      <li>
+        <p>投机推理状态机和CFSM状态机冲突</p>
+      </li>
+      <li>
+        <p>重新分词导到草稿模型的采样和目标模型位置对不上，影响了投机推理的无损特点。</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>影响Cot，当前的大模型的输出会经过大量的Cot之后再输出，替换模型输出会导致影响Cot的效果，甚至出现乱码</p>
+  </li>
+</ol>
+
+<p>Jump-Forward和投机推理的理念也是处在一个生态位，因此当前基本上被投机推理替代了。</p>
+
+<h4 id="sglangxgrammarmtp协同优化">SGLang+XGrammar+MTP协同优化</h4>
+
+<p>问题：MTP出现的token不符合JSON语法，浪费算力。</p>
+
+<p>解决：</p>
+
+<p>Drafting阶段（带约束的草稿）：</p>
+
+<ol>
+  <li>
+    <p>逐层掩码剪枝。具体做法是，根据草稿树，生成合法token位掩码（存在多选择）</p>
+  </li>
+  <li>
+    <p>在投机采样topk之前，强行将非Mask的token概率改为0.</p>
+  </li>
+</ol>
+
+<p>验证阶段（带约束的验证）：</p>
+
+<p>验证阶段需要保证目标模型的采样概率和draft模型的采样概率一致。因此需要把同样的mask发给目标模型，让目标模型也做非Mask的token概率修改。（如果bitmask在drafting阶段计算过，可以直接复用）</p>
+
+<ol>
+  <li>将草稿树序列化为(draft_tokens, retrieve_next_token, retrieve_next_sibling)</li>
+</ol>
+
+<pre><code class="language-Python">xgr.GrammarMatcher.traverse_draft_tree(
+    retrieve_next_token,    # int64 一维数组：指向当前节点的“第一个子节点”下标（-1 表示无子节点）
+    retrieve_next_sibling,  # int64 一维数组：指向当前节点的“下一个兄弟节点”下标（-1 表示无兄弟）
+    draft_tokens,           # int64 一维数组：每个节点预测出的 Token ID
+    bitmask,                # int32 二维张量 [num_nodes, bitmask_size]：输出缓冲区
+    batch_index=0,          # 当前请求在 bitmask 缓冲区中的起始行偏移
+    time_threshold=-1.0     # 超时熔断阈值（防止极端大树拖慢主线程）
+)
+</code></pre>
+
+<ol>
+  <li>DFS生成整棵树的Bitmask统一发给GPU</li>
+</ol>
+
+<h3 id="api-speculation">API Speculation</h3>
+
+<p>api投机指的是sglang后端接入的是Open API接口的闭源模型，我们只能通过接口来交互，不能直接去调度模型，通过一些工程上的技巧来节省token，减小请求延迟。</p>
+
+<pre><code class="language-Python">S+=context+"name:"+gen("name",stop="\n")+"job:"+gen("job",stop="\n")
+</code></pre>
+
+<p>如上面的代码，我们希望模型生成两部分的内容，分别是name:[name]，和job:[job]。正常情况下会分为两次Open APi交互。</p>
+
+<p>SGLang可以选择将中间的stop=”\n”去掉，故意让模型多输出一部分，将多输出的部分缓存下来。和后续的”job:”进行字符串匹配，如果匹配，就直接将缓存作为第二次的输出。不匹配，再重新调用Open API交互。</p>
+
+<p>hit-&gt; one longer gen</p>
+
+<p>miss-&gt;two gen</p>
+
+<h3 id="hicache">HiCache</h3>
+
+<p>核心概念：</p>
+
+<p>L1:GPU memory</p>
+
+<p>L2:host memory</p>
+
+<p>L3:distributed storage(mooncake/3FS/NIXL/AIBrip)</p>
+
+<p><img src="/sglang/assets/image%203.png" alt="image.png" /></p>
+
+<p>其中L1\L2在不同的instance间彼此隔离。L3在所有instances间共享。</p>
+
+<p><img src="/sglang/assets/image%2014.png" alt="image.png" /></p>
+
+<h4 id="local-matchl1l2">Local match(L1\L2)</h4>
+
+<p>Local match:请求从radixtree根节点开始匹配。</p>
+
+<p><img src="/sglang/assets/image%2011.png" alt="image.png" /></p>
+
+<p>Load_back策略（启发式）：在L2命中的kv cache会通过逐层掩盖的方式后续加载到L1再使用。</p>
+
+<ul>
+  <li>
+    <p>待加载的 KV Token 数量是否低于 <code class="language-plaintext highlighter-rouge">load_back_threshold</code>（传统实现中为 10 Token）。</p>
+  </li>
+  <li>
+    <p>当前load_back策略的内存配额是否耗尽。</p>
+  </li>
+  <li>
+    <p>GPU KV Cache Pool 是否能够分配足够空间。</p>
+  </li>
+</ul>
+
+<h4 id="prefetchl3-l2">Prefetch(L3-&gt;L2)</h4>
+
+<p>匹配长度超阈值(default:256）才会进行prefetch</p>
+
+<p><strong>策略</strong> (GPU准备好进行prefill时，是否要等待prefetch操作）：</p>
+
+<p>Best effort：GPU准备好就立即执行prefill(prefetch可能只完成部分）</p>
+
+<p>wait_complete:等待所有的prefetch操作完成再执行prefill</p>
+
+<p>time_out:等地啊prefetch完成或者超时后，执行prefill</p>
+
+<p>因此从L3到L2的加载时间主要和请求在进入prefill batch前的排队时间。</p>
+
+<h4 id="write_backl1-l2-l3">write_back(L1-&gt;L2-L3)</h4>
+
+<p><strong>策略</strong> ：</p>
+
+<p>write_through:立即写入下一层级(L1-&gt;L2-&gt;L3)
+write_through_selective:只写入高频数据(访问次数到达阈值再写入下一层级）</p>
+
+<p>write_back：上一层级发生evicited时再写入下一层级。</p>
+
+<h4 id="multi-rank-synchronization">Multi-Rank Synchronization</h4>
+
+<p>对于TP并行，需要确保所有rank命中的长度保持一致(理论上应该是自然保持一致，但实际上可能会因为程序执行\通信速度差异导致在GPU准备好计算时，不同rank上的kv cache长度不一致。需要做一次all_reduce, 同步所有rank的命中长度（按最小长度）</p>
+
+<h4 id="data-transfer-optimization">Data Transfer Optimization</h4>
+
+<ol>
+  <li>
+    <p>Zero-Copy Data Transfer:</p>
+
+    <p>L2-&gt;L3传输时消除缓冲区的copy。</p>
+
+    <p>从$CPU\xrightarrow{memcpy}缓冲区\xrightarrow{RDMA}L3
+$</p>
+
+    <p>变为</p>
+
+    <p>$CPU\xrightarrow{RDMA}L3$</p>
+  </li>
+  <li>
+    <p>Batch-Oriented Data Organization</p>
+
+    <p>KV在L2-&gt;L3传输时会按照page存放，减少IO次数</p>
+  </li>
+  <li>
+    <p>CPU-to-GPU transfer optimization</p>
+
+    <ol>
+      <li>
+        <p>计算掩盖（层间掩盖）</p>
+      </li>
+      <li>
+        <p>GPU-assisted I/O kernels: 专门的GPU kernels优化速度</p>
+      </li>
+    </ol>
+  </li>
+  <li>
+    <p>PD分离优化</p>
+
+    <p>P和D共用L3层级-&gt;Decode的结果可以提高Prefill阶段的命中率</p>
+  </li>
+</ol>
+
+<h3 id="hisparse">HiSparse</h3>
+
+<p>（for DSA, only PD disaggregation mode and decode instance)</p>
+
+<h4 id="工作流">工作流：</h4>
+
+<ol>
+  <li>
+    <p>Forward decode-&gt;生成下一个token</p>
+  </li>
+  <li>
+    <p>Top-k selection</p>
+  </li>
+  <li>
+    <p>Swap-in:CUDA kernel从host加载top-k KV到device</p>
+
+    <p>短序列：全存在GPU</p>
+
+    <p>长序列：命中检测-&gt;LRU-&gt;(host-&gt;device copy)</p>
+  </li>
+  <li>
+    <p>Decode attention-&gt; 使用Top-k计算Attn</p>
+  </li>
+  <li>
+    <p>Eager backup-&gt;异步复制新的KV到host</p>
+  </li>
+</ol>
+
+<h4 id="pd-disaggregation-integrationdirct--to-host">PD Disaggregation Integration(Dirct  to host)</h4>
+
+<p>$Prefill\ GPU\xrightarrow{RDMA}Decode\ Host\ Pool(pinned\ CPU\ mem)\xrightarrow{根据Top-kswap-in}Decode\ GPU\ KV\ Buffer$</p>
+
+<p>Shared-Index prefetch:Dsv4.1 Flash等</p>
+
+<ol>
+  <li>
+    <p>shared-Index：多个layer共用Top-k Token索引</p>
+  </li>
+  <li>
+    <p>Prefetch：根据索引提前prefetch后续层的kv。（不需要重新计算命中和LRU算法，可以直接进入(host-device)阶段）</p>
+  </li>
+</ol>
+
+<h3 id="pd分离">PD分离</h3>
+
+<p>sglang中的pd分离架构为将两个server变成动态链接的方式，在新请求到达的时候，选择最低负载的prefill和decode来进行动态链接。这样有个好处就是方便集群动态扩容。sglang甚至实现了prefill和decode实例之间的动态切换。</p>
+
+<p><img src="/sglang/assets/image%206.png" alt="image.png" /></p>
+
+<h3 id="sglang-simulator">SGLang Simulator</h3>
+
+<p><img src="/sglang/assets/img_v3_0216n_2fafdb7b-1e78-44b4-969b-1249c1b2179g.png" alt="img_v3_0216n_2fafdb7b-1e78-44b4-969b-1249c1b2179g.png" /></p>
+
+<p>核心思想：保持原生的sglang代码不做修改，确保调度执行逻辑和仿真调度一致。</p>
+
+<p>SGLang Simulator intercepts SGLang through a <strong>two-level hook system</strong> (<code class="language-plaintext highlighter-rouge">builtins.build_class</code> + <code class="language-plaintext highlighter-rouge">sys.meta_path</code>) without any source modification。</p>
+
+<p><img src="/sglang/assets/image%2016.png" alt="image.png" /></p>
+
+<h4 id="劫持">劫持</h4>
+
+<p>劫持主要有两种实现方式：</p>
+
+<p><strong>Class Hook：</strong><code class="language-plaintext highlighter-rouge">builtins.build_class</code></p>
+
+<p>拦截 Python 类的构造过程，在类定义完成时修改方法。</p>
+
+<pre><code class="language-Python">original_build_class = builtins.__build_class__
+
+def hooked_build_class(func, name, *args, **kwargs):
+    cls = original_build_class(func, name, *args, **kwargs)
+
+    if name == "ModelRunner":
+        cls.forward = fake_forward
+        cls.sample = fake_sample
+
+    return cls
+</code></pre>
+
+<p>当前通过class hook主要mock的几个类。</p>
+
+<p><img src="/sglang/assets/image%204.png" alt="image.png" /></p>
+
+<p>Class hook mock函数也尽量保证原始函数的执行，尽量使用wrap的方式来mock。</p>
+
+<p>比如Scheduler的<code class="language-plaintext highlighter-rouge">get_new_batch_prefill</code>。</p>
+
+<pre><code class="language-Python">def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+    start = time.perf_counter()
+    result = original_get_new_batch_prefill(self, *args, **kwargs) # 原函数
+    C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST = (
+        time.perf_counter() - start
+    )
+    # 插入计时、统计、逻辑时间控制。省略
+    return result
+</code></pre>
+
+<p><strong>Module Hook：</strong><code class="language-plaintext highlighter-rouge">sys.meta_path</code></p>
+
+<p>在 Python 模块导入过程中介入，处理需要替换的模块或 GPU Kernel 加载逻辑。</p>
+
+<p>用None替换了对CUDA的加载，解除了对GPU对依赖。</p>
+
+<pre><code class="language-C++">def install_load_utils_stub() -&gt; None:
+    module_name = "sgl_kernel.load_utils"
+
+    module = sys.modules.get(module_name)
+
+    if module is None:
+        module = types.ModuleType(module_name)
+        module.__package__ = "sgl_kernel"
+        sys.modules[module_name] = module
+
+    module._load_architecture_specific_ops = (
+        lambda *args, **kwargs: None
+    )
+    module._preload_cuda_library = (
+        lambda *args, **kwargs: None
+    )
+</code></pre>
+
+<h4 id="输入格式">输入格式</h4>
+
+<p>支持三种输入方式：</p>
+
+<ol>
+  <li><strong>Synthetic Workload</strong></li>
+</ol>
+
+<pre><code class="language-SQL">python3 benchmark/simulator/bench_serving.py \
+  --simulator-mode offline \
+  --backend sglang \
+  --base-url http://127.0.0.1:30000 \
+  --model /path/to/model \
+  --dataset-name random \
+  --random-input-len 2048 \
+  --random-output-len 256 \
+  --num-prompts 1000 \
+  --request-rate 20
+</code></pre>
+
+<p>采用柏松过程模拟时间，token id随机生成。</p>
+
+<ol>
+  <li><strong>ShareGPT Workload</strong></li>
+</ol>
+
+<pre><code class="language-JSON">[
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "Explain continuous batching"
+      },
+      {
+        "from": "gpt",
+        "value": "Continuous batching is..."
+      }
+    ]
+  }
+]
+</code></pre>
+
+<p>请求到达时间依然采用柏松过程模拟，但是tokenid从dataset中采样，格式如上。</p>
+
+<ol>
+  <li>Autobench Trace</li>
+</ol>
+
+<pre><code class="language-Python">{"arrival_time": 0.0, "input_length": 1024, "output_length": 128}
+{"arrival_time": 0.015, "input_length": 4096, "output_length": 256}
+{"arrival_time": 0.020, "input_length": 2048, "output_length": 64}
+</code></pre>
+
+<p>请求到达时间使用真实的时间戳。</p>
+
+<h4 id="kv-cache管理">KV cache管理</h4>
+
+<p>仿真和真实执行的一个关键差异：</p>
+
+<p>llm模型output的结果产生的kv cache也会影响缓存命中，仿真没有执行真正的forward，无法得到真实的output值。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>对比维度</th>
+      <th>真实 SGLang</th>
+      <th>SGLang Simulator</th>
+      <th>仿真误差</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Output Length</strong></td>
+      <td>模型动态生成，由 EOS、Stop 条件或最大长度决定</td>
+      <td>Workload 预设输出长度</td>
+      <td>影响 Decode 轮数、KV Cache 占用和调度</td>
+    </tr>
+    <tr>
+      <td><strong>Output Token 内容</strong></td>
+      <td>模型根据 Logits 采样得到真实 Token ID</td>
+      <td>使用固定 Token ID <code class="language-plaintext highlighter-rouge">1</code> 占位</td>
+      <td>影响生成历史相关的 Prefix Cache 命中准确性</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4 id="blocking和offline模式">BLOCKING和OFFLINE模式。</h4>
+
+<ul>
+  <li>
+    <p>OFFLINE：使用逻辑时间（Logical Time）模拟 GPU 执行，不需要真的等待。</p>
+  </li>
+  <li>
+    <p>BLOCKING：使用真实墙钟时间（Wall-clock Time）推进执行，通过 <code class="language-plaintext highlighter-rouge">sleep</code> 模拟 GPU 计算耗时。</p>
+  </li>
+</ul>
+
+<h4 id="predictor">Predictor</h4>
+
+<ol>
+  <li>AISimulate</li>
+</ol>
+
+<p>输入模型、硬件、Batch 信息，根据算子性能数据库，通过性能模型估算。</p>
+
+<ol>
+  <li>ML</li>
+</ol>
+
+<p>使用机器学习对真实执行数据进行拟合。</p>
+
+<ol>
+  <li>Replay</li>
+</ol>
+
+<p>查表。未记录的batch采用最近邻匹配。</p>
+
+<p>三个predictor最终都是获得一个forward的执行时间，用于scheduler的时间记录。</p>
+
+<h4 id="并行仿真">并行仿真</h4>
+
+<p>当前SGLang Simulator只会起一个worker。但是实际的TP并行，会给每个rank起一个worker。</p>
+
+<p>当前多TP的仿真时间只会针对一个worker进行模拟，具体TP带来的影响交给了predictor来模拟一次前向的处理时间。</p>
+
+<p>当前仿真不包含多DP仿真，不包含sgl-router的行为（已进入官方的Roadmap）。</p>
+
+<p>QA：vllm和sglang的区别在哪里？</p>
+
+<p>最初的sglang的核心思想是前端DSL和后端SRT协同优化，但是经过几年的演进，目前sglang的工作中心主要转向了后端SRT的优化。在前端调用上已经和vllm趋同，都使用异步API server的方式。</p>
+
+<p>sglang另一个核心思想是JF，当前也已被投机推理给替代。</p>
+
+<p>最后在kv的管理上，是sglang依然保留的和vllm的主要区别。</p>
+
+<p>vllm和sglang经过多年思想碰撞，趋同演进，已经非常趋同了。如sglang借鉴vllm的chunked prefill概念、借鉴vllm的异步api server，vllm借鉴sglang的radix tree思想，修改入队方式为反向入队，抛弃了v0的时间戳概念，evicted策略也变为了LRU。</p>
+
+<p>前面的区域，以后再来探索吧。</p>
+
+
+  </div>
+</div>
+
+<noscript>
+  <style>
+    .doc-toc { display: none; }
+    .doc-layout { display: block; }
+  </style>
+</noscript>
+
+<style>
+  .doc-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+    gap: 2rem;
+    align-items: start;
+  }
+
+  .doc-body {
+    min-width: 0;
+  }
+
+  .doc-toc {
+    position: sticky;
+    top: 1.5rem;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+    padding-right: 1rem;
+    border-right: 1px solid #e1e4e8;
+    font-size: 0.85rem;
+    line-height: 1.45;
+  }
+
+  .doc-toc details {
+    margin: 0;
+  }
+
+  .doc-toc summary {
+    cursor: pointer;
+    list-style: none;
+    font-weight: 600;
+    color: #159957;
+    margin-bottom: 0.75rem;
+  }
+
+  .doc-toc summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .doc-toc summary::before {
+    content: "▾ ";
+  }
+
+  .doc-toc details:not([open]) summary::before {
+    content: "▸ ";
+  }
+
+  .doc-toc nav ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .doc-toc nav li {
+    margin: 0.3rem 0;
+  }
+
+  .doc-toc nav a {
+    display: block;
+    color: #606c71;
+    text-decoration: none;
+    padding-left: 0.55rem;
+    border-left: 2px solid transparent;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .doc-toc nav a:hover,
+  .doc-toc nav a.active {
+    color: #159957;
+    border-left-color: #159957;
+  }
+
+  .doc-toc nav .toc-h3 a {
+    padding-left: 1.25rem;
+  }
+
+  .doc-toc nav .toc-h4 a {
+    padding-left: 1.95rem;
+    font-size: 0.8rem;
+  }
+
+  .doc-toc-top {
+    display: inline-block;
+    margin-top: 0.9rem;
+    color: #606c71;
+    font-size: 0.8rem;
+    text-decoration: none;
+  }
+
+  .doc-toc-top:hover {
+    color: #159957;
+  }
+
+  .doc-body h2,
+  .doc-body h3,
+  .doc-body h4 {
+    scroll-margin-top: 1.25rem;
+  }
+
+  .doc-body pre {
+    overflow-x: auto;
+  }
+
+  @media (max-width: 900px) {
+    .doc-layout {
+      display: block;
+    }
+
+    .doc-toc {
+      position: static;
+      max-height: none;
+      overflow: visible;
+      margin-bottom: 1.5rem;
+      padding: 0 0 1rem;
+      border-right: 0;
+      border-bottom: 1px solid #e1e4e8;
+    }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    html {
+      scroll-behavior: smooth;
+    }
+  }
+</style>
+
+<script>
+  (function () {
+    function buildToc() {
+      var body = document.querySelector(".doc-body");
+      var aside = document.querySelector(".doc-toc");
+      var nav = document.getElementById("doc-toc-nav");
+      if (!body || !aside || !nav) {
+        return;
+      }
+
+      var headings = Array.prototype.slice.call(
+        body.querySelectorAll("h2, h3, h4")
+      );
+      if (headings.length === 0) {
+        aside.hidden = true;
+        return;
+      }
+
+      var details = aside.querySelector("details");
+      if (
+        details &&
+        window.matchMedia &&
+        window.matchMedia("(max-width: 900px)").matches
+      ) {
+        details.removeAttribute("open");
+      }
+
+      var list = document.createElement("ul");
+      var items = [];
+
+      headings.forEach(function (heading, index) {
+        if (!heading.id) {
+          heading.id = "section-" + (index + 1);
+        }
+
+        var item = document.createElement("li");
+        item.className = "toc-" + heading.tagName.toLowerCase();
+
+        var link = document.createElement("a");
+        link.href = "#" + heading.id;
+        link.textContent = (heading.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        item.appendChild(link);
+        list.appendChild(item);
+        items.push({ heading: heading, link: link });
+      });
+
+      nav.appendChild(list);
+
+      var ticking = false;
+      function updateActive() {
+        var current = items[0];
+        items.forEach(function (item) {
+          if (item.heading.getBoundingClientRect().top <= 96) {
+            current = item;
+          }
+        });
+
+        items.forEach(function (item) {
+          var isCurrent = item === current;
+          item.link.classList.toggle("active", isCurrent);
+          if (isCurrent) {
+            item.link.setAttribute("aria-current", "location");
+          } else {
+            item.link.removeAttribute("aria-current");
+          }
+        });
+
+        ticking = false;
+      }
+
+      function onScroll() {
+        if (!ticking) {
+          window.requestAnimationFrame(updateActive);
+          ticking = true;
+        }
+      }
+
+      window.addEventListener("scroll", onScroll, { passive: true });
+      updateActive();
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", buildToc);
+    } else {
+      buildToc();
+    }
+  })();
+</script>
+
+
+      <footer class="site-footer">
+        
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a>.</span>
+      </footer>
+    </main>
+  </body>
+</html>
