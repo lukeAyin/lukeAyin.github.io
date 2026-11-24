@@ -1,12 +1,12 @@
 ---
 layout: toc
 title: SGLang 博客系列
-description: 无 NPU 性能预测的源码学习与架构笔记
+description: SGLang 源码学习、架构笔记与无 NPU 性能预测
 ---
 
 # SGLang 博客系列
 
-这个系列记录我为实现**无 NPU 性能预测**而学习 SGLang 源码的过程：沿着请求与调度、模型执行、KV Cache、异步 overlap、平台初始化与性能指标的路径，逐段核对真实实现，并把功能行为、模块关系和时间语义整理成文档。
+这个系列记录我学习 SGLang 源码与架构的过程。一条线围绕无 NPU 性能预测，沿着请求与调度、模型执行、KV Cache、异步 overlap、平台初始化与性能指标逐段核对实现；另一条线整理 SGLang 的前端、KV 复用、HiCache、投机推理与 Simulator 等机制。
 
 ## 学习笔记
 
